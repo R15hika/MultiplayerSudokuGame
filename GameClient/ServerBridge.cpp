@@ -3,28 +3,6 @@
 #include "../Shared/WireFormat.h"
 #pragma comment(lib, "Ws2_32.lib")
 
-namespace
-{
-    constexpr std::uint32_t kHeaderSize = 4;
-    constexpr int kTempReadSize = 4096;
-
-    void WriteLengthPrefix(std::vector<std::uint8_t>& buffer, std::uint32_t length)
-    {
-        buffer.push_back(static_cast<std::uint8_t>((length >> 24) & 0xFF));
-        buffer.push_back(static_cast<std::uint8_t>((length >> 16) & 0xFF));
-        buffer.push_back(static_cast<std::uint8_t>((length >> 8) & 0xFF));
-        buffer.push_back(static_cast<std::uint8_t>(length & 0xFF));
-    }
-
-    std::uint32_t ReadLengthPrefix(const std::vector<std::uint8_t>& buffer, std::size_t offset)
-    {
-        return (static_cast<std::uint32_t>(buffer[offset]) << 24) |
-            (static_cast<std::uint32_t>(buffer[offset + 1]) << 16) |
-            (static_cast<std::uint32_t>(buffer[offset + 2]) << 8) |
-            (static_cast<std::uint32_t>(buffer[offset + 3]));
-    }
-}
-
 ServerBridge::ServerBridge()
 {
 }
@@ -68,7 +46,18 @@ bool ServerBridge::SetSocketNonBlocking(SOCKET socketHandle)
     return ::ioctlsocket(socketHandle, FIONBIO, &nonBlocking) == 0;
 }
 
-bool ServerBridge::Connect(const std::string& host, unsigned short port)
+bool ServerBridge::EnableBroadcast(SOCKET socketHandle)
+{
+    BOOL broadcast = TRUE;
+    return ::setsockopt(
+        socketHandle,
+        SOL_SOCKET,
+        SO_BROADCAST,
+        reinterpret_cast<const char*>(&broadcast),
+        sizeof(broadcast)) == 0;
+}
+
+bool ServerBridge::Connect(unsigned short port)
 {
     Disconnect();
 
@@ -77,26 +66,10 @@ bool ServerBridge::Connect(const std::string& host, unsigned short port)
         return false;
     }
 
-    mSocket = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    mSocket = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if (mSocket == INVALID_SOCKET)
     {
         ShutdownWinsock();
-        return false;
-    }
-
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_port = htons(port);
-
-    if (::inet_pton(AF_INET, host.c_str(), &address.sin_addr) != 1)
-    {
-        Disconnect();
-        return false;
-    }
-
-    if (::connect(mSocket, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == SOCKET_ERROR)
-    {
-        Disconnect();
         return false;
     }
 
@@ -106,9 +79,35 @@ bool ServerBridge::Connect(const std::string& host, unsigned short port)
         return false;
     }
 
-    mHost = host;
+    if (!EnableBroadcast(mSocket))
+    {
+        Disconnect();
+        return false;
+    }
+
+    sockaddr_in localAddr{};
+    localAddr.sin_family = AF_INET;
+    localAddr.sin_addr.s_addr = htonl(INADDR_ANY);
+    localAddr.sin_port = htons(0);
+
+    if (::bind(mSocket, reinterpret_cast<sockaddr*>(&localAddr), sizeof(localAddr)) == SOCKET_ERROR)
+    {
+        Disconnect();
+        return false;
+    }
+
+    mBroadcastAddr = {};
+    mBroadcastAddr.sin_family = AF_INET;
+    mBroadcastAddr.sin_port = htons(port);
+    mBroadcastAddr.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+
+    mServerAddr = {};
     mPort = port;
+    mHost.clear();
     mConnected = true;
+    mServerDiscovered = false;
+    mLastDiscoverSent = std::chrono::steady_clock::time_point{};
+
     return true;
 }
 
@@ -119,7 +118,8 @@ void ServerBridge::Disconnect()
     mAssignedRoomId = 0;
     mHost.clear();
     mPort = 0;
-    mReceiveBuffer.clear();
+    mPendingReliable.clear();
+    mSeenIncoming.clear();
 
     while (!mInbox.empty())
     {
@@ -140,169 +140,153 @@ bool ServerBridge::IsConnected() const
     return mConnected;
 }
 
-bool ServerBridge::SendAll(const std::uint8_t* data, int byteCount)
+bool ServerBridge::HasDiscoveredServer() const
 {
-    int totalSent = 0;
-
-    while (totalSent < byteCount)
-    {
-        int sent = ::send(
-            mSocket,
-            reinterpret_cast<const char*>(data + totalSent),
-            byteCount - totalSent,
-            0
-        );
-
-        if (sent == SOCKET_ERROR)
-        {
-            int error = ::WSAGetLastError();
-            if (error == WSAEWOULDBLOCK)
-            {
-                continue;
-            }
-
-            return false;
-        }
-
-        if (sent <= 0)
-        {
-            return false;
-        }
-
-        totalSent += sent;
-    }
-
-    return true;
+    return mServerDiscovered;
 }
 
-bool ServerBridge::SendPayload(const std::vector<std::uint8_t>& payload)
+void ServerBridge::SendDiscoverServerRequest()
+{
+    if (!mConnected || mSocket == INVALID_SOCKET || mServerDiscovered)
+    {
+        return;
+    }
+
+    std::vector<std::uint8_t> payload = WireFormat::MakeDiscoverServerPacket();
+
+    ByteWriter writer;
+    writer.WriteUInt32(0);
+    writer.WriteUInt32(0);
+    writer.WriteBool(false);
+
+    for (std::uint8_t b : payload)
+    {
+        writer.WriteUInt8(b);
+    }
+
+    std::vector<std::uint8_t> bytes = writer.GetBuffer();
+
+    ::sendto(
+        mSocket,
+        reinterpret_cast<const char*>(bytes.data()),
+        static_cast<int>(bytes.size()),
+        0,
+        reinterpret_cast<const sockaddr*>(&mBroadcastAddr),
+        sizeof(mBroadcastAddr)
+    );
+}
+
+bool ServerBridge::SendAck(std::uint32_t ack)
 {
     if (!mConnected || mSocket == INVALID_SOCKET)
     {
         return false;
     }
 
-    std::vector<std::uint8_t> framedPacket;
-    framedPacket.reserve(kHeaderSize + payload.size());
+    ByteWriter writer;
+    writer.WriteUInt32(0);
+    writer.WriteUInt32(ack);
+    writer.WriteBool(true);
 
-    WriteLengthPrefix(framedPacket, static_cast<std::uint32_t>(payload.size()));
-    framedPacket.insert(framedPacket.end(), payload.begin(), payload.end());
+    const std::vector<std::uint8_t>& payload = writer.GetBuffer();
 
-    return SendAll(framedPacket.data(), static_cast<int>(framedPacket.size()));
+    int sent = ::sendto(
+        mSocket,
+        reinterpret_cast<const char*>(payload.data()),
+        static_cast<int>(payload.size()),
+        0,
+        reinterpret_cast<const sockaddr*>(&mServerAddr),
+        sizeof(mServerAddr)
+    );
+
+    return sent == static_cast<int>(payload.size());
 }
 
-void ServerBridge::SendSignUpRequest(const std::string& playerName, const std::string& password)
+bool ServerBridge::SendReliablePayload(const std::vector<std::uint8_t>& payload)
 {
-    AuthRequest request{};
-    request.playerName = playerName;
-    request.password = password;
-    SendPayload(WireFormat::MakeSignUpPacket(request));
+    if (!mConnected || mSocket == INVALID_SOCKET || !mServerDiscovered)
+    {
+        return false;
+    }
+
+    std::uint32_t seq = mNextSequence++;
+
+    ByteWriter writer;
+    writer.WriteUInt32(seq);
+    writer.WriteUInt32(0);
+    writer.WriteBool(false);
+
+    for (std::uint8_t b : payload)
+    {
+        writer.WriteUInt8(b);
+    }
+
+    std::vector<std::uint8_t> bytes = writer.GetBuffer();
+
+    int sent = ::sendto(
+        mSocket,
+        reinterpret_cast<const char*>(bytes.data()),
+        static_cast<int>(bytes.size()),
+        0,
+        reinterpret_cast<const sockaddr*>(&mServerAddr),
+        sizeof(mServerAddr)
+    );
+
+    if (sent == static_cast<int>(bytes.size()))
+    {
+        PendingPacket pp{};
+        pp.bytes = bytes;
+        pp.lastSent = std::chrono::steady_clock::now();
+        mPendingReliable[seq] = std::move(pp);
+        return true;
+    }
+
+    return false;
 }
 
-void ServerBridge::SendSignInRequest(const std::string& playerName, const std::string& password)
+void ServerBridge::PollResends()
 {
-    AuthRequest request{};
-    request.playerName = playerName;
-    request.password = password;
-    SendPayload(WireFormat::MakeSignInPacket(request));
+    if (!mConnected || mSocket == INVALID_SOCKET)
+    {
+        return;
+    }
+
+    auto now = std::chrono::steady_clock::now();
+
+    if (!mServerDiscovered)
+    {
+        if (mLastDiscoverSent.time_since_epoch().count() == 0 ||
+            std::chrono::duration_cast<std::chrono::milliseconds>(now - mLastDiscoverSent).count() >= 1000)
+        {
+            SendDiscoverServerRequest();
+            mLastDiscoverSent = now;
+        }
+
+        return;
+    }
+
+    for (auto& pair : mPendingReliable)
+    {
+        auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - pair.second.lastSent).count();
+        if (elapsed >= 100)
+        {
+            ::sendto(
+                mSocket,
+                reinterpret_cast<const char*>(pair.second.bytes.data()),
+                static_cast<int>(pair.second.bytes.size()),
+                0,
+                reinterpret_cast<const sockaddr*>(&mServerAddr),
+                sizeof(mServerAddr)
+            );
+
+            pair.second.lastSent = now;
+        }
+    }
 }
 
-void ServerBridge::SendCreateRoomRequest(const CreateRoomRequest& request)
+void ServerBridge::PushMessage(const BridgeMessage& msg)
 {
-    SendPayload(WireFormat::MakeCreateRoomPacket(request));
-}
-
-void ServerBridge::SendJoinRoomRequest(int roomId)
-{
-    JoinRoomRequest request{};
-    request.roomId = roomId;
-    SendPayload(WireFormat::MakeJoinRoomPacket(request));
-}
-
-
-void ServerBridge::SendReadyToggleRequest(bool ready)
-{
-    SendPayload(WireFormat::MakeReadyTogglePacket(ready));
-}
-
-void ServerBridge::SendSubmitCellRequest(int row, int col, int value)
-{
-    CellInputRequest request{};
-    request.row = row;
-    request.col = col;
-    request.value = value;
-    SendPayload(WireFormat::MakeSubmitCellPacket(request));
-}
-
-void ServerBridge::SendPlayAgainRequest(bool playAgain)
-{
-    SendPayload(WireFormat::MakePlayAgainPacket(playAgain));
-}
-
-void ServerBridge::SendUseHintRequest(int row, int col)
-{
-    HintRequest request{};
-    request.row = row;
-    request.col = col;
-    SendPayload(WireFormat::MakeUseHintPacket(request));
-}
-
-void ServerBridge::SendLeaveRoomRequest()
-{
-    SendPayload(WireFormat::MakeLeaveRoomRequestPacket());
-}
-
-void ServerBridge::SendHistoryRequest()
-{
-    SendPayload(WireFormat::MakeHistoryRequestPacket());
-}
-
-void ServerBridge::SendRequestPublicRoomList()
-{
-    SendPayload(WireFormat::MakeRequestPublicRoomListPacket());
-}
-
-void ServerBridge::SendRoomChatMessage(const std::string& text)
-{
-    SendPayload(WireFormat::MakeSendRoomChatPacket(text));
-}
-
-void ServerBridge::SendSearchUserRequest(const std::string& username)
-{
-    SendPayload(WireFormat::MakeSearchUserPacket(username));
-}
-
-void ServerBridge::SendFriendRequest(const std::string& username)
-{
-    FriendRequestPayload payload{};
-    payload.targetUsername = username;
-    SendPayload(WireFormat::MakeSendFriendRequestPacket(payload));
-}
-
-void ServerBridge::SendFriendRequestResponse(const std::string& fromUsername, bool accept)
-{
-    FriendRequestDecision decision{};
-    decision.fromUsername = fromUsername;
-    decision.accept = accept;
-    SendPayload(WireFormat::MakeRespondFriendRequestPacket(decision));
-}
-
-void ServerBridge::SendRequestFriendsList()
-{
-    SendPayload(WireFormat::MakeRequestFriendsListPacket());
-}
-
-void ServerBridge::SendRequestPendingFriendRequests()
-{
-    SendPayload(WireFormat::MakeRequestPendingFriendRequestsPacket());
-}
-
-void ServerBridge::SendPrivateMessage(const std::string& targetUsername, const std::string& text)
-{
-    PrivateMessagePayload payload{};
-    payload.targetUsername = targetUsername;
-    payload.text = text;
-    SendPayload(WireFormat::MakeSendPrivateMessagePacket(payload));
+    mInbox.push(msg);
 }
 
 bool ServerBridge::HasPendingMessage() const
@@ -338,11 +322,6 @@ void ServerBridge::ClearRoomAssignment()
     mAssignedPlayerId = 0;
 }
 
-void ServerBridge::PushMessage(const BridgeMessage& msg)
-{
-    mInbox.push(msg);
-}
-
 void ServerBridge::DecodePacket(const std::vector<std::uint8_t>& payload)
 {
     try
@@ -355,6 +334,13 @@ void ServerBridge::DecodePacket(const std::vector<std::uint8_t>& payload)
 
         switch (kind)
         {
+
+        case PacketKind::ServerAnnounce:
+        {
+            ServerAnnounceData announce = WireFormat::ReadServerAnnounce(reader);
+            msg.text = announce.serverName;
+            break;
+        }
 
         case PacketKind::AuthResponse:
             msg.authResponse = WireFormat::ReadAuthResponse(reader);
@@ -450,9 +436,6 @@ void ServerBridge::DecodePacket(const std::vector<std::uint8_t>& payload)
             msg.text = reader.ReadString();
             break;
 
-        case PacketKind::CountdownStarted:
-            break;
-
         case PacketKind::ErrorNotice:
             msg.text = reader.ReadString();
             break;
@@ -472,7 +455,6 @@ void ServerBridge::DecodePacket(const std::vector<std::uint8_t>& payload)
     }
 }
 
-
 void ServerBridge::PollIncoming()
 {
     if (!mConnected || mSocket == INVALID_SOCKET)
@@ -480,51 +462,80 @@ void ServerBridge::PollIncoming()
         return;
     }
 
-    std::uint8_t tempBuffer[kTempReadSize]{};
+    std::uint8_t tempBuffer[4096]{};
 
     while (true)
     {
-        int bytesRead = ::recv(
+        sockaddr_in from{};
+        int fromLen = sizeof(from);
+
+        int bytesRead = ::recvfrom(
             mSocket,
             reinterpret_cast<char*>(tempBuffer),
-            kTempReadSize,
-            0
+            4096,
+            0,
+            reinterpret_cast<sockaddr*>(&from),
+            &fromLen
         );
 
         if (bytesRead > 0)
         {
-            mReceiveBuffer.insert(
-                mReceiveBuffer.end(),
-                tempBuffer,
-                tempBuffer + bytesRead
-            );
-
-            while (mReceiveBuffer.size() >= kHeaderSize)
+            if (bytesRead < 9)
             {
-                std::uint32_t payloadLength = ReadLengthPrefix(mReceiveBuffer, 0);
+                continue;
+            }
 
-                if (mReceiveBuffer.size() < kHeaderSize + payloadLength)
+            std::vector<std::uint8_t> bytes(tempBuffer, tempBuffer + bytesRead);
+            ByteReader envReader(bytes);
+
+            ReliableEnvelope env{};
+            env.sequence = envReader.ReadUInt32();
+            env.ack = envReader.ReadUInt32();
+            env.isAckOnly = envReader.ReadBool();
+
+            if (env.ack != 0)
+            {
+                mPendingReliable.erase(env.ack);
+            }
+
+            if (env.isAckOnly)
+            {
+                continue;
+            }
+
+            if (env.sequence != 0)
+            {
+                SendAck(env.sequence);
+
+                if (mSeenIncoming.find(env.sequence) != mSeenIncoming.end())
                 {
-                    break;
+                    continue;
                 }
 
-                std::vector<std::uint8_t> payload(
-                    mReceiveBuffer.begin() + kHeaderSize,
-                    mReceiveBuffer.begin() + kHeaderSize + payloadLength
-                );
-
-                DecodePacket(payload);
-
-                mReceiveBuffer.erase(
-                    mReceiveBuffer.begin(),
-                    mReceiveBuffer.begin() + kHeaderSize + payloadLength
-                );
+                mSeenIncoming[env.sequence] = true;
             }
-        }
-        else if (bytesRead == 0)
-        {
-            Disconnect();
-            break;
+
+            std::vector<std::uint8_t> payload(
+                bytes.begin() + 9,
+                bytes.end()
+            );
+
+            try
+            {
+                ByteReader probe(payload);
+                PacketKind kind = WireFormat::ReadPacketKind(probe);
+
+                if (kind == PacketKind::ServerAnnounce)
+                {
+                    mServerAddr = from;
+                    mServerDiscovered = true;
+                }
+            }
+            catch (...)
+            {
+            }
+
+            DecodePacket(payload);
         }
         else
         {
@@ -534,8 +545,130 @@ void ServerBridge::PollIncoming()
                 break;
             }
 
-            Disconnect();
             break;
         }
     }
+}
+
+void ServerBridge::SendSignUpRequest(const std::string& playerName, const std::string& password)
+{
+    AuthRequest request{};
+    request.playerName = playerName;
+    request.password = password;
+    SendReliablePayload(WireFormat::MakeSignUpPacket(request));
+}
+
+void ServerBridge::SendSignInRequest(const std::string& playerName, const std::string& password)
+{
+    AuthRequest request{};
+    request.playerName = playerName;
+    request.password = password;
+    SendReliablePayload(WireFormat::MakeSignInPacket(request));
+}
+
+void ServerBridge::SendCreateRoomRequest(const CreateRoomRequest& request)
+{
+    SendReliablePayload(WireFormat::MakeCreateRoomPacket(request));
+}
+
+void ServerBridge::SendJoinRoomRequest(int roomId)
+{
+    JoinRoomRequest request{};
+    request.roomId = roomId;
+    SendReliablePayload(WireFormat::MakeJoinRoomPacket(request));
+}
+
+void ServerBridge::SendReadyToggleRequest(bool ready)
+{
+    SendReliablePayload(WireFormat::MakeReadyTogglePacket(ready));
+}
+
+void ServerBridge::SendSubmitCellRequest(int row, int col, int value)
+{
+    CellInputRequest request{};
+    request.row = row;
+    request.col = col;
+    request.value = value;
+    SendReliablePayload(WireFormat::MakeSubmitCellPacket(request));
+}
+
+void ServerBridge::SendPlayAgainRequest(bool playAgain)
+{
+    SendReliablePayload(WireFormat::MakePlayAgainPacket(playAgain));
+}
+
+void ServerBridge::SendUseHintRequest(int row, int col)
+{
+    HintRequest request{};
+    request.row = row;
+    request.col = col;
+    SendReliablePayload(WireFormat::MakeUseHintPacket(request));
+}
+
+void ServerBridge::SendLeaveRoomRequest()
+{
+    SendReliablePayload(WireFormat::MakeLeaveRoomRequestPacket());
+}
+
+void ServerBridge::SendHistoryRequest()
+{
+    SendReliablePayload(WireFormat::MakeHistoryRequestPacket());
+}
+
+void ServerBridge::SendRequestPublicRoomList()
+{
+    SendReliablePayload(WireFormat::MakeRequestPublicRoomListPacket());
+}
+
+void ServerBridge::SendRoomChatMessage(const std::string& text)
+{
+    SendReliablePayload(WireFormat::MakeSendRoomChatPacket(text));
+}
+
+void ServerBridge::SendSearchUserRequest(const std::string& username)
+{
+    SendReliablePayload(WireFormat::MakeSearchUserPacket(username));
+}
+
+void ServerBridge::SendFriendRequest(const std::string& username)
+{
+    FriendRequestPayload payload{};
+    payload.targetUsername = username;
+    SendReliablePayload(WireFormat::MakeSendFriendRequestPacket(payload));
+}
+
+void ServerBridge::SendFriendRequestResponse(const std::string& fromUsername, bool accept)
+{
+    FriendRequestDecision decision{};
+    decision.fromUsername = fromUsername;
+    decision.accept = accept;
+    SendReliablePayload(WireFormat::MakeRespondFriendRequestPacket(decision));
+}
+
+void ServerBridge::SendRequestFriendsList()
+{
+    SendReliablePayload(WireFormat::MakeRequestFriendsListPacket());
+}
+
+void ServerBridge::SendRequestPendingFriendRequests()
+{
+    SendReliablePayload(WireFormat::MakeRequestPendingFriendRequestsPacket());
+}
+
+void ServerBridge::SendHeartbeat()
+{
+    SendReliablePayload(WireFormat::MakeHeartbeatPacket());
+}
+
+void ServerBridge::SendResumeMatchRequest()
+{
+    SendReliablePayload(WireFormat::MakeResumeMatchRequestPacket());
+}
+
+void ServerBridge::SendPrivateMessage(const std::string& targetUsername, const std::string& text)
+{
+    PrivateMessagePayload payload{};
+    payload.targetUsername = targetUsername;
+    payload.text = text;
+    SendReliablePayload(WireFormat::MakeSendPrivateMessagePacket(payload));
 }

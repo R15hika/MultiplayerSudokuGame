@@ -14,6 +14,12 @@
 
 #include <string>
 #include <sstream>
+#include <mmsystem.h>
+#include <objidl.h>
+#include <gdiplus.h>
+
+#pragma comment(lib, "winmm.lib")
+#pragma comment(lib, "gdiplus.lib")
 
 #include <array>
 #include "../Shared/PacketKinds.h"
@@ -115,9 +121,23 @@ struct AppState
 
     std::string selectedFriendName;
 
+    UiButton stayHereButton;
+    UiButton roundSummaryHomeButton;
+
+    UiButton resumeMatchButton;
+
+    ULONGLONG lastInputTick = 0;
+    ULONGLONG lastHeartbeatTick = 0;
+
+    bool presencePopupVisible = false;
+    bool localTimedOut = false;
+
 };
 
 static AppState gApp;
+
+static ULONG_PTR g_gdiplusToken = 0;
+static Gdiplus::Bitmap* g_startMenuBackground = nullptr;
 
 // Forward declarations
 ATOM MyRegisterClass(HINSTANCE hInstance);
@@ -136,7 +156,7 @@ static void DrawPuzzleArena(HDC hdc, const RECT& clientRect, AppState& app);
 static int GetHighlightedDigit(const PaintedBoard& painted);
 static void DrawRoundSummary(HDC hdc, const RECT& clientRect, AppState& app);
 static void DrawHistoryScreen(HDC hdc, const RECT& clientRect, AppState& app);
-static void DrawPublicRoomList(HDC hdc, const RECT& clientRect, AppState& app);
+static void DrawPublicRoomList(HDC hdc, const RECT& clientRect, AppState& app, bool forestChrome);
 static RECT GetHistoryBackButtonRect(const RECT& clientRect);
 static RECT GetHistoryContentRect(const RECT& clientRect);
 static RECT GetHistoryHeaderRect(const RECT& contentRect, int index, int totalColumns);
@@ -148,7 +168,7 @@ static RECT GetResponsiveBoardRect(const RECT& clientRect);
 static RECT GetSidebarRect(const RECT& clientRect);
 static RECT GetNotesButtonRect(const RECT& clientRect);
 static RECT GetHintButtonRect(const RECT& clientRect);
-static void DrawButton(HDC hdc, const UiButton& button);
+static void DrawButton(HDC hdc, const UiButton& button, bool forestChrome = false);
 static bool PointInRectEx(const RECT& rect, int x, int y);
 static bool RectsIntersect(const RECT& a, const RECT& b);
 static void ShowControlIfNotCovered(HWND hWnd, bool baseVisible, const RECT& popupRect);
@@ -171,12 +191,25 @@ static RECT GetSocialSearchButtonRect(const RECT& popupRect);
 static RECT GetSocialAddFriendButtonRect(const RECT& popupRect);
 static RECT GetSocialPrivateInputRect(const RECT& popupRect);
 static RECT GetSocialPrivateSendRect(const RECT& popupRect);
-static void DrawSocialPopup(HDC hdc, const RECT& clientRect, AppState& app);
-static void DrawSocialHome(HDC hdc, const RECT& popupRect, AppState& app);
-static void DrawSocialChatView(HDC hdc, const RECT& popupRect, AppState& app);
+static void DrawSocialPopup(HDC hdc, const RECT& clientRect, AppState& app, bool forestChrome);
+static void DrawSocialHome(HDC hdc, const RECT& popupRect, AppState& app, bool forestChrome);
+static void DrawSocialChatView(HDC hdc, const RECT& popupRect, AppState& app, bool forestChrome);
 static RECT GetSocialBackButtonRect(const RECT& popupRect);
 static RECT GetSocialChatMessagesRect(const RECT& popupRect);
 static bool HandleSocialPopupClick(int x, int y, AppState& app, const RECT& clientRect);
+static void StartBackgroundMusic();
+static void StopBackgroundMusic();
+static void InitGdiplusIfNeeded();
+static void ShutdownGdiplus();
+static void EnsureStartMenuBackgroundLoaded();
+static void ReleaseStartMenuBackground();
+static void DrawStartMenuBackground(HDC hdc, const RECT& clientRect);
+static void MarkUserActivity(AppState& app);
+static void UpdateIdleState(HWND hWnd, AppState& app);
+static RECT GetPresencePopupRect(const RECT& clientRect);
+static RECT GetPresenceYesButtonRect(const RECT& popupRect);
+static RECT GetPresenceResumeButtonRect(const RECT& popupRect);
+static void DrawPresencePopup(HDC hdc, const RECT& clientRect, AppState& app);
 
 int APIENTRY wWinMain(_In_ HINSTANCE hInstance,
     _In_opt_ HINSTANCE hPrevInstance,
@@ -265,6 +298,148 @@ static RECT MakeRect(int left, int top, int width, int height)
 {
     RECT r{ left, top, left + width, top + height };
     return r;
+}
+
+static void StartBackgroundMusic()
+{
+    constexpr int kMusicVolume = 250; // 0 - 1000 (lower = quieter)
+    const wchar_t* kMusicAlias = L"bgm";
+    const wchar_t* kMusicPath = L"..\\asset\\com net.mp3";
+
+    std::wstring openCmd = L"open \"";
+    openCmd += kMusicPath;
+    openCmd += L"\" type mpegvideo alias ";
+    openCmd += kMusicAlias;
+    mciSendStringW(openCmd.c_str(), nullptr, 0, nullptr);
+
+    std::wstring volumeCmd = L"setaudio ";
+    volumeCmd += kMusicAlias;
+    volumeCmd += L" volume to ";
+    volumeCmd += std::to_wstring(kMusicVolume);
+    mciSendStringW(volumeCmd.c_str(), nullptr, 0, nullptr);
+
+    std::wstring playCmd = L"play ";
+    playCmd += kMusicAlias;
+    playCmd += L" repeat";
+    mciSendStringW(playCmd.c_str(), nullptr, 0, nullptr);
+}
+
+static void StopBackgroundMusic()
+{
+    const wchar_t* kMusicAlias = L"bgm";
+    std::wstring stopCmd = L"stop ";
+    stopCmd += kMusicAlias;
+    mciSendStringW(stopCmd.c_str(), nullptr, 0, nullptr);
+
+    std::wstring closeCmd = L"close ";
+    closeCmd += kMusicAlias;
+    mciSendStringW(closeCmd.c_str(), nullptr, 0, nullptr);
+}
+
+static void InitGdiplusIfNeeded()
+{
+    if (g_gdiplusToken != 0)
+    {
+        return;
+    }
+
+    Gdiplus::GdiplusStartupInput input{};
+    Gdiplus::GdiplusStartup(&g_gdiplusToken, &input, nullptr);
+}
+
+static void ReleaseStartMenuBackground()
+{
+    delete g_startMenuBackground;
+    g_startMenuBackground = nullptr;
+}
+
+static void ShutdownGdiplus()
+{
+    ReleaseStartMenuBackground();
+
+    if (g_gdiplusToken != 0)
+    {
+        Gdiplus::GdiplusShutdown(g_gdiplusToken);
+        g_gdiplusToken = 0;
+    }
+}
+
+static void EnsureStartMenuBackgroundLoaded()
+{
+    if (g_startMenuBackground != nullptr)
+    {
+        return;
+    }
+
+    const wchar_t* fileNames[] =
+    {
+        L"forest_menu_background.png",
+        L"sudoku_menu_background.png",
+    };
+
+    for (const wchar_t* fileName : fileNames)
+    {
+        std::wstring paths[4];
+        int pathCount = 0;
+
+        paths[pathCount++] = std::wstring(L"..\\asset\\") + fileName;
+        paths[pathCount++] = std::wstring(L"..\\..\\asset\\") + fileName;
+
+        wchar_t module[MAX_PATH]{};
+        if (GetModuleFileNameW(nullptr, module, MAX_PATH) != 0)
+        {
+            wchar_t* slash = wcsrchr(module, L'\\');
+            if (slash != nullptr)
+            {
+                *(slash + 1) = L'\0';
+                std::wstring base(module);
+                paths[pathCount++] = base + L"..\\..\\asset\\" + fileName;
+                paths[pathCount++] = base + L"..\\asset\\" + fileName;
+            }
+        }
+
+        for (int i = 0; i < pathCount; ++i)
+        {
+            Gdiplus::Bitmap* bmp = Gdiplus::Bitmap::FromFile(paths[i].c_str());
+            if (bmp != nullptr && bmp->GetLastStatus() == Gdiplus::Ok)
+            {
+                g_startMenuBackground = bmp;
+                return;
+            }
+
+            delete bmp;
+        }
+    }
+}
+
+static void DrawStartMenuBackground(HDC hdc, const RECT& clientRect)
+{
+    EnsureStartMenuBackgroundLoaded();
+
+    int w = clientRect.right - clientRect.left;
+    int h = clientRect.bottom - clientRect.top;
+    if (w <= 0 || h <= 0)
+    {
+        return;
+    }
+
+    if (g_startMenuBackground != nullptr && g_startMenuBackground->GetLastStatus() == Gdiplus::Ok)
+    {
+        Gdiplus::Graphics g(hdc);
+        g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        Gdiplus::Rect dest(
+            clientRect.left,
+            clientRect.top,
+            w,
+            h);
+        g.DrawImage(g_startMenuBackground, dest);
+    }
+    else
+    {
+        HBRUSH bgBrush = CreateSolidBrush(RGB(245, 245, 245));
+        FillRect(hdc, &clientRect, bgBrush);
+        DeleteObject(bgBrush);
+    }
 }
 
 static void UpdateStartMenuLayout(HWND hWnd, AppState& app)
@@ -388,6 +563,9 @@ static void InitializeUiLayout(AppState& app)
     app.socialAcceptFriendButton.text = L"Accept";
     app.socialPrivateSendButton.text = L"Send";
     app.socialBackButton.text = L"Back";
+    app.stayHereButton.text = L"Yes, Continue";
+    app.roundSummaryHomeButton.text = L"Home";
+    app.resumeMatchButton.text = L"Resume";
 
     for (int i = 0; i < 9; ++i)
     {
@@ -464,7 +642,6 @@ static void CreateChildControls(HWND hWnd)
 static void UpdateControlVisibility(AppState& app)
 {
     bool showStartControls = (app.viewport.GetPhase() == ScreenPhase::StartMenu);
-    bool showChatControls = false;
 
     bool showSocialPopup =
         app.authenticated &&
@@ -472,6 +649,11 @@ static void UpdateControlVisibility(AppState& app)
         (app.viewport.GetPhase() == ScreenPhase::StartMenu ||
             app.viewport.GetPhase() == ScreenPhase::WaitingRoom ||
             app.viewport.GetPhase() == ScreenPhase::Playing);
+
+    bool showChatControls =
+        (app.viewport.GetPhase() == ScreenPhase::WaitingRoom ||
+            app.viewport.GetPhase() == ScreenPhase::Playing) &&
+        !showSocialPopup;
 
     bool allowStartControls = showStartControls && !showSocialPopup;
 
@@ -586,6 +768,147 @@ static bool PointInRectEx(const RECT& rect, int x, int y)
         y >= rect.top && y < rect.bottom;
 }
 
+static void MarkUserActivity(AppState& app)
+{
+    app.lastInputTick = GetTickCount64();
+
+    ScreenPhase phase = app.viewport.GetPhase();
+    bool trackPhase =
+        (phase == ScreenPhase::WaitingRoom || phase == ScreenPhase::Playing);
+
+    if (!trackPhase || !app.authenticated)
+    {
+        return;
+    }
+
+    ULONGLONG now = GetTickCount64();
+    if (now - app.lastHeartbeatTick >= 1000)
+    {
+        app.bridge.SendHeartbeat();
+        app.lastHeartbeatTick = now;
+    }
+
+    if (phase == ScreenPhase::Playing)
+    {
+        app.presencePopupVisible = false;
+        app.localTimedOut = false;
+    }
+}
+
+static RECT GetPresencePopupRect(const RECT& clientRect)
+{
+    int w = 360;
+    int h = 170;
+    int left = clientRect.left + ((clientRect.right - clientRect.left) - w) / 2;
+    int top = clientRect.top + ((clientRect.bottom - clientRect.top) - h) / 2;
+    return RECT{ left, top, left + w, top + h };
+}
+
+static RECT GetPresenceYesButtonRect(const RECT& popupRect)
+{
+    return RECT{
+        popupRect.left + 110,
+        popupRect.bottom - 52,
+        popupRect.right - 110,
+        popupRect.bottom - 16
+    };
+}
+
+static RECT GetPresenceResumeButtonRect(const RECT& popupRect)
+{
+    return RECT{
+        popupRect.left + 110,
+        popupRect.bottom - 52,
+        popupRect.right - 110,
+        popupRect.bottom - 16
+    };
+}
+
+static void DrawPresencePopup(HDC hdc, const RECT& clientRect, AppState& app)
+{
+    if (app.viewport.GetPhase() != ScreenPhase::Playing || !app.presencePopupVisible)
+    {
+        return;
+    }
+
+    RECT popup = GetPresencePopupRect(clientRect);
+
+    HBRUSH bg = CreateSolidBrush(RGB(255, 255, 255));
+    FillRect(hdc, &popup, bg);
+    DeleteObject(bg);
+
+    FrameRect(hdc, &popup, (HBRUSH)GetStockObject(BLACK_BRUSH));
+
+    RECT titleRect{ popup.left + 16, popup.top + 14, popup.right - 16, popup.top + 40 };
+    DrawTextW(
+        hdc,
+        app.localTimedOut ? L"Disconnected" : L"Are you still there?",
+        -1,
+        &titleRect,
+        DT_CENTER | DT_SINGLELINE
+    );
+
+    std::wstring body =
+        app.localTimedOut
+        ? L"You were disconnected due to inactivity. Click Resume to continue if the match is still running."
+        : L"You have been idle for a while. Click Yes to keep playing.";
+
+    RECT bodyRect{ popup.left + 18, popup.top + 48, popup.right - 18, popup.top + 108 };
+    DrawTextW(hdc, body.c_str(), -1, &bodyRect, DT_WORDBREAK | DT_CENTER);
+
+    if (app.localTimedOut)
+    {
+        app.resumeMatchButton.rect = GetPresenceResumeButtonRect(popup);
+        app.resumeMatchButton.enabled = true;
+        DrawButton(hdc, app.resumeMatchButton);
+    }
+    else
+    {
+        app.stayHereButton.rect = GetPresenceYesButtonRect(popup);
+        app.stayHereButton.enabled = true;
+        DrawButton(hdc, app.stayHereButton);
+    }
+}
+
+static void UpdateIdleState(HWND hWnd, AppState& app)
+{
+    UNREFERENCED_PARAMETER(hWnd);
+
+    if (!app.authenticated)
+    {
+        app.presencePopupVisible = false;
+        app.localTimedOut = false;
+        return;
+    }
+
+    if (app.viewport.GetPhase() != ScreenPhase::Playing)
+    {
+        app.presencePopupVisible = false;
+        app.localTimedOut = false;
+        return;
+    }
+
+    ULONGLONG now = GetTickCount64();
+    ULONGLONG idleMs = now - app.lastInputTick;
+
+    if (idleMs >= 85000)
+    {
+        app.presencePopupVisible = true;
+        app.localTimedOut = true;
+        app.statusText = "Disconnected due to inactivity. Click Yes to resume if the match is still running.";
+    }
+    else if (idleMs >= 55000)
+    {
+        app.presencePopupVisible = true;
+        app.localTimedOut = false;
+    }
+    else
+    {
+        app.presencePopupVisible = false;
+        app.localTimedOut = false;
+    }
+}
+
 static bool RectsIntersect(const RECT& a, const RECT& b)
 {
     RECT out{};
@@ -627,24 +950,49 @@ static void ShowControlIfNotCovered(HWND hWnd, bool baseVisible, const RECT& pop
     EnableWindow(hWnd, covered ? FALSE : TRUE);
 }
 
-static void DrawButton(HDC hdc, const UiButton& button)
+static void DrawButton(HDC hdc, const UiButton& button, bool forestChrome)
 {
-    COLORREF fill = RGB(110, 165, 235);
+    COLORREF fill;
+    COLORREF borderColor;
 
-    if (button.completed)
+    if (forestChrome)
     {
-        fill = RGB(180, 180, 180);
+        fill = RGB(72, 118, 84);
+        borderColor = RGB(38, 62, 44);
+
+        if (button.completed)
+        {
+            fill = RGB(145, 150, 142);
+            borderColor = RGB(80, 88, 80);
+        }
+        else if (!button.enabled)
+        {
+            fill = RGB(130, 162, 138);
+            borderColor = RGB(70, 95, 76);
+        }
     }
-    else if (!button.enabled)
+    else
     {
-        fill = RGB(170, 200, 235);
+        fill = RGB(110, 165, 235);
+        borderColor = RGB(128, 128, 128);
+
+        if (button.completed)
+        {
+            fill = RGB(180, 180, 180);
+        }
+        else if (!button.enabled)
+        {
+            fill = RGB(170, 200, 235);
+        }
     }
 
     HBRUSH brush = CreateSolidBrush(fill);
     FillRect(hdc, &button.rect, brush);
     DeleteObject(brush);
 
-    FrameRect(hdc, &button.rect, (HBRUSH)GetStockObject(GRAY_BRUSH));
+    HBRUSH borderBrush = CreateSolidBrush(borderColor);
+    FrameRect(hdc, &button.rect, borderBrush);
+    DeleteObject(borderBrush);
 
     int btnH = button.rect.bottom - button.rect.top;
     int fontHeight = btnH / 2;
@@ -707,9 +1055,7 @@ static void DrawStartMenu(HDC hdc, const RECT& clientRect, AppState& app)
     RECT topCard = MakeRect(rightX, contentTop, rightAreaW, topCardH);
     RECT bottomCard = MakeRect(rightX, contentTop + topCardH + gap, rightAreaW, bottomCardH);
 
-    HBRUSH bgBrush = CreateSolidBrush(RGB(245, 245, 245));
-    FillRect(hdc, &clientRect, bgBrush);
-    DeleteObject(bgBrush);
+    DrawStartMenuBackground(hdc, clientRect);
 
     HFONT titleFont = CreateFontW(
         max(28, clientH / 16), 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
@@ -729,11 +1075,17 @@ static void DrawStartMenu(HDC hdc, const RECT& clientRect, AppState& app)
     HFONT oldFont = (HFONT)SelectObject(hdc, titleFont);
 
     RECT titleRect{ 0, titleTop, clientW, titleTop + titleHeight };
+    RECT titleShadowRect = titleRect;
+    OffsetRect(&titleShadowRect, 2, 2);
+    SetTextColor(hdc, RGB(18, 32, 22));
+    DrawTextW(hdc, L"Sudoku Rush", -1, &titleShadowRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SetTextColor(hdc, RGB(248, 252, 246));
     DrawTextW(hdc, L"Sudoku Rush", -1, &titleRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
+    SetTextColor(hdc, RGB(32, 48, 36));
 
-    HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(210, 210, 210));
+    HPEN borderPen = CreatePen(PS_SOLID, 1, RGB(88, 118, 92));
     HPEN oldPen = (HPEN)SelectObject(hdc, borderPen);
-    HBRUSH cardBrush = CreateSolidBrush(RGB(250, 250, 250));
+    HBRUSH cardBrush = CreateSolidBrush(RGB(255, 252, 245));
     HBRUSH oldBrush = (HBRUSH)SelectObject(hdc, cardBrush);
 
     RoundRect(hdc, leftCard.left, leftCard.top, leftCard.right, leftCard.bottom, 16, 16);
@@ -775,10 +1127,10 @@ static void DrawStartMenu(HDC hdc, const RECT& clientRect, AppState& app)
     app.createButton.enabled = app.authenticated && !app.pendingRoomRequest;
     app.joinButton.enabled = app.authenticated && !app.pendingRoomRequest;
 
-    DrawButton(hdc, app.signUpButton);
-    DrawButton(hdc, app.signInButton);
-    DrawButton(hdc, app.createButton);
-    DrawButton(hdc, app.joinButton);
+    DrawButton(hdc, app.signUpButton, true);
+    DrawButton(hdc, app.signInButton, true);
+    DrawButton(hdc, app.createButton, true);
+    DrawButton(hdc, app.joinButton, true);
 
     int historyW = max(90, clientW / 10);
     int historyH = max(34, clientH / 16);
@@ -793,18 +1145,32 @@ static void DrawStartMenu(HDC hdc, const RECT& clientRect, AppState& app)
     );
 
     app.historyButton.enabled = app.authenticated && !app.pendingRoomRequest;
-    DrawButton(hdc, app.historyButton);
+    DrawButton(hdc, app.historyButton, true);
 
-    std::wstring connText = app.bridge.IsConnected()
-        ? L"Connected to 127.0.0.1:54000"
-        : L"Not connected to server";
+    std::wstring connText;
+    if (!app.bridge.IsConnected())
+    {
+        connText = L"UDP client not ready";
+    }
+    else if (!app.bridge.HasDiscoveredServer())
+    {
+        connText = L"Searching for LAN server...";
+    }
+    else
+    {
+        connText = L"LAN server discovered";
+    }
+
+    COLORREF oldTextColor = SetTextColor(hdc, RGB(255, 255, 255));
 
     TextOutW(hdc, leftCard.left + pad, leftCard.bottom - 42, connText.c_str(), (int)connText.size());
 
     std::wstring status = L"Status: " + ToWide(app.statusText);
     TextOutW(hdc, leftCard.left + pad, leftCard.bottom + 18, status.c_str(), (int)status.size());
-    DrawPublicRoomList(hdc, clientRect, app);
-    DrawSocialPopup(hdc, clientRect, app);
+
+    SetTextColor(hdc, oldTextColor);
+    DrawPublicRoomList(hdc, clientRect, app, true);
+    DrawSocialPopup(hdc, clientRect, app, true);
 
     SelectObject(hdc, oldPen);
     DeleteObject(borderPen);
@@ -815,7 +1181,7 @@ static void DrawStartMenu(HDC hdc, const RECT& clientRect, AppState& app)
     DeleteObject(labelFont);
 }
 
-static void DrawPublicRoomList(HDC hdc, const RECT& clientRect, AppState& app)
+static void DrawPublicRoomList(HDC hdc, const RECT& clientRect, AppState& app, bool forestChrome)
 {
     app.publicRoomJoinRects.clear();
 
@@ -842,13 +1208,35 @@ static void DrawPublicRoomList(HDC hdc, const RECT& clientRect, AppState& app)
     int buttonPad = max(8, clientW / 100);
 
     RECT titleRect{ rightX, topY, rightX + width, topY + 30 };
-    DrawTextW(hdc, L"Public Available Rooms", -1, &titleRect, DT_LEFT | DT_SINGLELINE);
+    if (forestChrome)
+    {
+        RECT trSh = titleRect;
+        OffsetRect(&trSh, 1, 1);
+        SetTextColor(hdc, RGB(12, 26, 18));
+        DrawTextW(hdc, L"Public Available Rooms", -1, &trSh, DT_LEFT | DT_SINGLELINE);
+        SetTextColor(hdc, RGB(244, 250, 242));
+        DrawTextW(hdc, L"Public Available Rooms", -1, &titleRect, DT_LEFT | DT_SINGLELINE);
+        SetTextColor(hdc, RGB(28, 42, 32));
+    }
+    else
+    {
+        DrawTextW(hdc, L"Public Available Rooms", -1, &titleRect, DT_LEFT | DT_SINGLELINE);
+    }
 
     int y = topY + 40;
 
     if (app.publicRooms.empty())
     {
         RECT emptyRect{ rightX, y, rightX + width, y + rowH };
+        if (forestChrome)
+        {
+            HBRUSH rowBg = CreateSolidBrush(RGB(255, 252, 245));
+            FillRect(hdc, &emptyRect, rowBg);
+            DeleteObject(rowBg);
+            HBRUSH rowBorder = CreateSolidBrush(RGB(90, 118, 94));
+            FrameRect(hdc, &emptyRect, rowBorder);
+            DeleteObject(rowBorder);
+        }
         DrawTextW(hdc, L"No public rooms available.", -1, &emptyRect, DT_LEFT | DT_VCENTER | DT_SINGLELINE);
         return;
     }
@@ -858,7 +1246,19 @@ static void DrawPublicRoomList(HDC hdc, const RECT& clientRect, AppState& app)
         const PublicRoomInfo& room = app.publicRooms[i];
 
         RECT rowRect{ rightX, y, rightX + width, y + rowH };
-        FrameRect(hdc, &rowRect, (HBRUSH)GetStockObject(GRAY_BRUSH));
+        if (forestChrome)
+        {
+            HBRUSH rowBg = CreateSolidBrush(RGB(255, 252, 245));
+            FillRect(hdc, &rowRect, rowBg);
+            DeleteObject(rowBg);
+            HBRUSH rowBorder = CreateSolidBrush(RGB(90, 118, 94));
+            FrameRect(hdc, &rowRect, rowBorder);
+            DeleteObject(rowBorder);
+        }
+        else
+        {
+            FrameRect(hdc, &rowRect, (HBRUSH)GetStockObject(GRAY_BRUSH));
+        }
 
         std::wstringstream text;
         text << L"Room " << room.roomId
@@ -896,13 +1296,13 @@ static void DrawPublicRoomList(HDC hdc, const RECT& clientRect, AppState& app)
         joinBtn.rect = joinRect;
         joinBtn.text = L"Join";
         joinBtn.enabled = true;
-        DrawButton(hdc, joinBtn);
+        DrawButton(hdc, joinBtn, forestChrome);
 
         y += rowH + max(8, clientH / 80);
     }
 }
 
-static void DrawSocialPopup(HDC hdc, const RECT& clientRect, AppState& app)
+static void DrawSocialPopup(HDC hdc, const RECT& clientRect, AppState& app, bool forestChrome)
 {
     if (!app.authenticated)
     {
@@ -912,7 +1312,7 @@ static void DrawSocialPopup(HDC hdc, const RECT& clientRect, AppState& app)
     app.socialLauncherButton.rect = GetSocialLauncherRect(clientRect);
     app.socialLauncherButton.text = app.socialPopupOpen ? L"X" : L"+";
     app.socialLauncherButton.enabled = true;
-    DrawButton(hdc, app.socialLauncherButton);
+    DrawButton(hdc, app.socialLauncherButton, forestChrome);
 
     if (!app.socialPopupOpen)
     {
@@ -921,22 +1321,31 @@ static void DrawSocialPopup(HDC hdc, const RECT& clientRect, AppState& app)
 
     RECT popup = GetSocialPopupRect(clientRect);
 
-    HBRUSH popupBrush = CreateSolidBrush(RGB(252, 252, 252));
+    HBRUSH popupBrush = CreateSolidBrush(forestChrome ? RGB(255, 252, 246) : RGB(252, 252, 252));
     FillRect(hdc, &popup, popupBrush);
     DeleteObject(popupBrush);
-    FrameRect(hdc, &popup, (HBRUSH)GetStockObject(GRAY_BRUSH));
-
-    if (app.socialChatViewOpen)
+    if (forestChrome)
     {
-        DrawSocialChatView(hdc, popup, app);
+        HBRUSH frameBr = CreateSolidBrush(RGB(86, 115, 90));
+        FrameRect(hdc, &popup, frameBr);
+        DeleteObject(frameBr);
     }
     else
     {
-        DrawSocialHome(hdc, popup, app);
+        FrameRect(hdc, &popup, (HBRUSH)GetStockObject(GRAY_BRUSH));
+    }
+
+    if (app.socialChatViewOpen)
+    {
+        DrawSocialChatView(hdc, popup, app, forestChrome);
+    }
+    else
+    {
+        DrawSocialHome(hdc, popup, app, forestChrome);
     }
 }
 
-static void DrawSocialHome(HDC hdc, const RECT& popup, AppState& app)
+static void DrawSocialHome(HDC hdc, const RECT& popup, AppState& app, bool forestChrome)
 {
     app.pendingRequestRects.clear();
     app.friendRects.clear();
@@ -963,8 +1372,8 @@ static void DrawSocialHome(HDC hdc, const RECT& popup, AppState& app)
     app.socialSearchButton.rect = searchBtnRect;
     app.socialAddFriendButton.rect = addBtnRect;
 
-    DrawButton(hdc, app.socialSearchButton);
-    DrawButton(hdc, app.socialAddFriendButton);
+    DrawButton(hdc, app.socialSearchButton, forestChrome);
+    DrawButton(hdc, app.socialAddFriendButton, forestChrome);
 
     RECT statusRect{ popup.left + 16, popup.top + 126, popup.right - 16, popup.top + 146 };
     std::wstring socialStatus = ToWide(app.socialStatusText);
@@ -1002,7 +1411,7 @@ static void DrawSocialHome(HDC hdc, const RECT& popup, AppState& app)
     }
 }
 
-static void DrawSocialChatView(HDC hdc, const RECT& popup, AppState& app)
+static void DrawSocialChatView(HDC hdc, const RECT& popup, AppState& app, bool forestChrome)
 {
     RECT titleRect{ popup.left + 16, popup.top + 12, popup.right - 120, popup.top + 34 };
     std::wstring title = app.selectedFriendName.empty()
@@ -1012,10 +1421,19 @@ static void DrawSocialChatView(HDC hdc, const RECT& popup, AppState& app)
 
     app.socialBackButton.rect = GetSocialBackButtonRect(popup);
     app.socialBackButton.enabled = true;
-    DrawButton(hdc, app.socialBackButton);
+    DrawButton(hdc, app.socialBackButton, forestChrome);
 
     RECT messagesRect = GetSocialChatMessagesRect(popup);
-    FrameRect(hdc, &messagesRect, (HBRUSH)GetStockObject(GRAY_BRUSH));
+    if (forestChrome)
+    {
+        HBRUSH msgBr = CreateSolidBrush(RGB(95, 120, 98));
+        FrameRect(hdc, &messagesRect, msgBr);
+        DeleteObject(msgBr);
+    }
+    else
+    {
+        FrameRect(hdc, &messagesRect, (HBRUSH)GetStockObject(GRAY_BRUSH));
+    }
 
     RECT inputRect = GetSocialPrivateInputRect(popup);
     RECT sendRect = GetSocialPrivateSendRect(popup);
@@ -1033,7 +1451,7 @@ static void DrawSocialChatView(HDC hdc, const RECT& popup, AppState& app)
     ShowWindow(app.hSocialSearchEdit, SW_HIDE);
 
     app.socialPrivateSendButton.rect = sendRect;
-    DrawButton(hdc, app.socialPrivateSendButton);
+    DrawButton(hdc, app.socialPrivateSendButton, forestChrome);
 
     int lineH = 20;
     int y = messagesRect.top + 10;
@@ -1500,7 +1918,6 @@ static int GetHighlightedDigit(const PaintedBoard& painted)
 
 static void DrawRoundSummary(HDC hdc, const RECT& clientRect, AppState& app)
 {
-    UNREFERENCED_PARAMETER(clientRect);
 
     SetBkMode(hdc, TRANSPARENT);
 
@@ -1545,6 +1962,9 @@ static void DrawRoundSummary(HDC hdc, const RECT& clientRect, AppState& app)
 
     TextOutW(hdc, 40, y + 20, playAgainText.c_str(), (int)playAgainText.size());
     TextOutW(hdc, 40, y + 50, L"Press P to toggle Play Again", 29);
+    app.roundSummaryHomeButton.rect = MakeRect(clientRect.right - 150, 40, 100, 36);
+    app.roundSummaryHomeButton.enabled = true;
+    DrawButton(hdc, app.roundSummaryHomeButton);
 }
 
 static void DrawHistoryScreen(HDC hdc, const RECT& clientRect, AppState& app)
@@ -1742,7 +2162,7 @@ static void DrawCurrentScreen(HDC hdc, const RECT& clientRect, AppState& app)
 
     case ScreenPhase::WaitingRoom:
         DrawWaitingRoom(hdc, clientRect, app);
-        DrawSocialPopup(hdc, clientRect, app);
+        DrawSocialPopup(hdc, clientRect, app, false);
         break;
 
     case ScreenPhase::Countdown:
@@ -1754,7 +2174,8 @@ static void DrawCurrentScreen(HDC hdc, const RECT& clientRect, AppState& app)
 
     case ScreenPhase::Playing:
         DrawPuzzleArena(hdc, clientRect, app);
-        DrawSocialPopup(hdc, clientRect, app);
+        DrawSocialPopup(hdc, clientRect, app, false);
+        DrawPresencePopup(hdc, clientRect, app);
         break;
 
     case ScreenPhase::RoundSummary:
@@ -1802,6 +2223,9 @@ static void ProcessIncomingMessages(AppState& app)
             {
                 app.roomChatMessages.clear();
                 app.viewport.SetPhase(ScreenPhase::WaitingRoom);
+                app.lastInputTick = GetTickCount64();
+                app.presencePopupVisible = false;
+                app.localTimedOut = false;
                 app.statusText = msg.roomJoin.text + " Room ID: " + std::to_string(msg.roomJoin.roomId);
             }
             else
@@ -1818,6 +2242,8 @@ static void ProcessIncomingMessages(AppState& app)
             break;
 
         case PacketKind::LeaveRoomResponse:
+            app.presencePopupVisible = false;
+            app.localTimedOut = false;
             app.bridge.ClearRoomAssignment();
             app.waitingRoom = WaitingRoom{};
             app.publicRooms.clear();
@@ -1830,6 +2256,8 @@ static void ProcessIncomingMessages(AppState& app)
             break;
 
         case PacketKind::RoomClosedNotice:
+            app.presencePopupVisible = false;
+            app.localTimedOut = false;
             app.bridge.ClearRoomAssignment();
             app.waitingRoom = WaitingRoom{};
             app.publicRooms.clear();
@@ -1854,13 +2282,17 @@ static void ProcessIncomingMessages(AppState& app)
             break;
 
         case PacketKind::MatchStarted:
-    if (app.bridge.GetAssignedRoomId() != 0)
-    {
-        app.viewport.ResetForNewMatch();
-        app.viewport.ApplyPuzzle(msg.puzzleData);
-        app.viewport.SetPhase(ScreenPhase::Playing);
-        app.statusText = "Match started.";
-    }
+            if (app.bridge.GetAssignedRoomId() != 0)
+            {
+                app.viewport.ResetForNewMatch();
+                app.viewport.ApplyPuzzle(msg.puzzleData);
+                app.viewport.SetPhase(ScreenPhase::Playing);
+                app.lastInputTick = GetTickCount64();
+                app.presencePopupVisible = false;
+                app.localTimedOut = false;
+                app.statusText = "Match started.";
+            }
+            break;
     break;
 
         case PacketKind::CellCheckedResponse:
@@ -1874,10 +2306,25 @@ static void ProcessIncomingMessages(AppState& app)
         case PacketKind::LeaderboardUpdate:
             app.viewport.UpdateLeaderboard(msg.leaderboard);
             app.roundSummary.UpdateFinalLeaderboard(msg.leaderboard);
+
+            if (app.viewport.GetPhase() == ScreenPhase::Playing && app.localTimedOut)
+            {
+                app.localTimedOut = false;
+                app.presencePopupVisible = false;
+                app.lastInputTick = GetTickCount64();
+                app.statusText = "Resume successful.";
+            }
             break;
 
         case PacketKind::HintUnlockedNotice:
             app.viewport.SetHintState(msg.hintState);
+
+            if (app.viewport.GetPhase() == ScreenPhase::Playing && app.localTimedOut)
+            {
+                app.localTimedOut = false;
+                app.presencePopupVisible = false;
+                app.lastInputTick = GetTickCount64();
+            }
             break;
 
         case PacketKind::HistoryResponse:
@@ -1945,6 +2392,11 @@ static void ProcessIncomingMessages(AppState& app)
         case PacketKind::ErrorNotice:
             app.statusText = msg.text;
             app.pendingRoomRequest = false;
+
+            if (app.localTimedOut)
+            {
+                app.presencePopupVisible = true;
+            }
             break;
 
         default:
@@ -2028,7 +2480,7 @@ static void HandleStartMenuClick(HWND hWnd, int x, int y, AppState& app)
     }
 
     RECT clientRect{};
-    GetClientRect(GetActiveWindow(), &clientRect);
+    GetClientRect(hWnd, &clientRect);
 
     if (PointInRectEx(app.historyButton.rect, x, y) && app.historyButton.enabled)
     {
@@ -2540,6 +2992,9 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         CreateChildControls(hWnd);
         UpdateStartMenuLayout(hWnd, gApp);
 
+        InitGdiplusIfNeeded();
+        EnsureStartMenuBackgroundLoaded();
+
         gApp.hWinCrownIcon = (HICON)LoadImageW(
             nullptr,
             L"wincrown.ico",
@@ -2558,8 +3013,13 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             LR_LOADFROMFILE | LR_DEFAULTSIZE
         );
 
-        gApp.connected = gApp.bridge.Connect("127.0.0.1", 54000);
-        gApp.statusText = gApp.connected ? "Connected to server." : "Failed to connect to server.";
+        gApp.connected = gApp.bridge.Connect(54000);
+        gApp.statusText = gApp.connected ? "Searching for LAN server..." : "Failed to initialize UDP client.";
+
+        gApp.lastInputTick = GetTickCount64();
+        gApp.lastHeartbeatTick = 0;
+
+        StartBackgroundMusic();
 
         SetTimer(hWnd, TIMER_ID_MAIN, TIMER_INTERVAL_MS, nullptr);
         UpdateControlVisibility(gApp);
@@ -2576,8 +3036,10 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
         std::size_t oldPublicRoomCount = gApp.publicRooms.size();
 
         gApp.bridge.PollIncoming();
+        gApp.bridge.PollResends();
         ProcessIncomingMessages(gApp);
         UpdateControlVisibility(gApp);
+        UpdateIdleState(hWnd, gApp);
 
         static int publicRoomRefreshTick = 0;
 
@@ -2611,12 +3073,23 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     }
     return 0;
 
+    case WM_MOUSEMOVE:
+    {
+        if (!gApp.localTimedOut)
+        {
+            MarkUserActivity(gApp);
+        }
+        return 0;
+    }
+
     case WM_LBUTTONDOWN:
     {
 
 
         int x = GET_X_LPARAM(lParam);
         int y = GET_Y_LPARAM(lParam);
+
+        MarkUserActivity(gApp);
 
         RECT clientRect{};
         GetClientRect(hWnd, &clientRect);
@@ -2683,6 +3156,47 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             RECT clientRect{};
             GetClientRect(hWnd, &clientRect);
 
+            if (gApp.presencePopupVisible)
+            {
+                RECT popup = GetPresencePopupRect(clientRect);
+
+                if (gApp.localTimedOut)
+                {
+                    RECT resumeRect = GetPresenceResumeButtonRect(popup);
+
+                    if (PointInRectEx(resumeRect, x, y))
+                    {
+                        gApp.statusText = "Requesting resume...";
+                        gApp.bridge.SendResumeMatchRequest();
+                    }
+
+                    InvalidateRect(hWnd, nullptr, FALSE);
+                    return 0;
+                }
+                else
+                {
+                    RECT yesRect = GetPresenceYesButtonRect(popup);
+
+                    if (PointInRectEx(yesRect, x, y))
+                    {
+                        gApp.localTimedOut = false;
+                        gApp.presencePopupVisible = false;
+                        gApp.lastInputTick = GetTickCount64();
+                        gApp.bridge.SendHeartbeat();
+                        gApp.statusText = "Continuing current match.";
+                    }
+
+                    InvalidateRect(hWnd, nullptr, FALSE);
+                    return 0;
+                }
+            }
+
+            if (gApp.localTimedOut)
+            {
+                InvalidateRect(hWnd, nullptr, FALSE);
+                return 0;
+            }
+
             RECT notesRect = GetNotesButtonRect(clientRect);
             RECT hintRect = GetHintButtonRect(clientRect);
 
@@ -2746,6 +3260,17 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             break;
         }
 
+        case ScreenPhase::RoundSummary:
+        {
+            if (PointInRectEx(gApp.roundSummaryHomeButton.rect, x, y))
+            {
+                gApp.bridge.SendLeaveRoomRequest();
+                gApp.statusText = "Returning to main menu...";
+                InvalidateRect(hWnd, nullptr, FALSE);
+            }
+            break;
+        }
+
         case ScreenPhase::History:
         {
             RECT clientRect{};
@@ -2770,7 +3295,11 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     {
         if (gApp.viewport.GetPhase() == ScreenPhase::Playing)
         {
-            HandlePuzzleKey(wParam, gApp);
+            if (!gApp.localTimedOut)
+            {
+                MarkUserActivity(gApp);
+                HandlePuzzleKey(wParam, gApp);
+            }
             InvalidateRect(hWnd, nullptr, FALSE);
         }
         else if (gApp.viewport.GetPhase() == ScreenPhase::RoundSummary)
@@ -2832,9 +3361,12 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
 
         HGDIOBJ oldBmp = SelectObject(memDC, memBmp);
 
-        HBRUSH bg = CreateSolidBrush(RGB(245, 245, 245));
-        FillRect(memDC, &clientRect, bg);
-        DeleteObject(bg);
+        if (gApp.viewport.GetPhase() != ScreenPhase::StartMenu)
+        {
+            HBRUSH bg = CreateSolidBrush(RGB(245, 245, 245));
+            FillRect(memDC, &clientRect, bg);
+            DeleteObject(bg);
+        }
 
         DrawCurrentScreen(memDC, clientRect, gApp);
 
@@ -2855,6 +3387,25 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
     }
     return 0;
 
+    case WM_CLOSE:
+    {
+        if (gApp.bridge.IsConnected() && gApp.bridge.GetAssignedRoomId() != 0)
+        {
+            gApp.bridge.SendLeaveRoomRequest();
+
+            DWORD start = GetTickCount();
+            while (GetTickCount() - start < 200)
+            {
+                gApp.bridge.PollIncoming();
+                gApp.bridge.PollResends();
+                Sleep(10);
+            }
+        }
+
+        DestroyWindow(hWnd);
+        return 0;
+    }
+
     case WM_DESTROY:
         KillTimer(hWnd, TIMER_ID_MAIN);
 
@@ -2870,6 +3421,8 @@ LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
             gApp.hLoseCrownIcon = nullptr;
         }
 
+        StopBackgroundMusic();
+        ShutdownGdiplus();
         gApp.bridge.Disconnect();
         PostQuitMessage(0);
         return 0;
