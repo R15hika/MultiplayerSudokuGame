@@ -29,6 +29,8 @@ public:
     std::vector<MatchStatsSnapshot> GetMatchStats() const;
     int GetElapsedMatchSeconds() const;
 
+private:
+
 
 struct ServerPlayerState
 {

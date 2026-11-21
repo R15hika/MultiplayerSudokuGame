@@ -524,6 +524,28 @@ bool HostEngine::IsHostOfRoom(int playerId, int roomId) const
     return mRooms.IsHost(roomId, playerId);
 }
 
+bool HostEngine::IsMatchRunningForPlayer(int playerId) const
+{
+    const ConnectionProfile* player = FindProfileInternal(playerId);
+    if (player == nullptr)
+    {
+        return false;
+    }
+
+    if (player->GetRoomId() == 0)
+    {
+        return false;
+    }
+
+    const RoomDirectory::RoomEntry* room = mRooms.FindRoom(player->GetRoomId());
+    if (room == nullptr)
+    {
+        return false;
+    }
+
+    return room->match.IsRoundRunning();
+}
+
 bool HostEngine::CloseRoom(int roomId)
 {
     const RoomDirectory::RoomEntry* room = mRooms.FindRoom(roomId);

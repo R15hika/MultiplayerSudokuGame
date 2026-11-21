@@ -11,53 +11,36 @@
 #include "SocketHub.h"
 #include "UserDatabase.h"
 #include "../Shared/WireFormat.h"
-
 namespace
 {
+    std::uint32_t gServerSequence = 1;
 
-    std::vector<int> GetConnectionsForPlayers(
-        const std::vector<int>& playerIds,
-        const std::unordered_map<int, int>& connectionToPlayer)
-    {
-        std::vector<int> result;
-
-        for (int pid : playerIds)
-        {
-            for (const auto& pair : connectionToPlayer)
-            {
-                if (pair.second == pid)
-                {
-                    result.push_back(pair.first);
-                    break;
-                }
-            }
-        }
-
-        return result;
-    }
+    constexpr long long kWaitingRoomIdleMs = 85000;
+    constexpr long long kPlayingWarnIdleMs = 55000;
+    constexpr long long kPlayingTimeoutMs =  85000;
 
     std::string GetCurrentDateTimeString()
     {
         std::time_t now = std::time(nullptr);
         std::tm localTime{};
-        #ifdef _WIN32
-                localtime_s(&localTime, &now);
-        #else
-                localTime = *std::localtime(&now);
-        #endif
+#ifdef _WIN32
+        localtime_s(&localTime, &now);
+#else
+        localTime = *std::localtime(&now);
+#endif
 
         std::ostringstream oss;
         oss << std::put_time(&localTime, "%Y-%m-%d %H:%M:%S");
         return oss.str();
     }
 
-    std::string GetUsernameForConnection(
-        int connectionId,
-        const std::unordered_map<int, int>& connectionToPlayer,
+    std::string GetUsernameForEndpoint(
+        const NetAddress& endpoint,
+        const std::unordered_map<NetAddress, int, NetAddressHash>& endpointToPlayer,
         const HostEngine& hostEngine)
     {
-        auto mapIt = connectionToPlayer.find(connectionId);
-        if (mapIt == connectionToPlayer.end())
+        auto mapIt = endpointToPlayer.find(endpoint);
+        if (mapIt == endpointToPlayer.end())
         {
             return "";
         }
@@ -66,60 +49,99 @@ namespace
         return profile ? profile->GetPlayerName() : "";
     }
 
-    int FindConnectionIdByUsername(
+    NetAddress* FindEndpointByUsername(
         const std::string& username,
-        const std::unordered_map<int, int>& connectionToPlayer,
+        std::unordered_map<int, NetAddress>& playerToEndpoint,
         const HostEngine& hostEngine)
     {
-        for (const auto& pair : connectionToPlayer)
+        for (auto& pair : playerToEndpoint)
         {
-            const ConnectionProfile* profile = hostEngine.FindPlayerProfile(pair.second);
-            if (profile != nullptr && profile->GetPlayerName() == username)
+            const ConnectionProfile* profile = hostEngine.FindPlayerProfile(pair.first);
+            if (profile != nullptr && profile->GetPlayerName() == username && profile->IsConnected())
             {
-                return pair.first;
+                return &pair.second;
             }
         }
-        return 0;
+        return nullptr;
     }
 
-    bool IsUsernameAlreadyLoggedIn(
-        const std::string& username,
-        const std::unordered_map<int, int>& connectionToPlayer,
-        const HostEngine& hostEngine)
+    std::vector<NetAddress> GetEndpointsForPlayers(
+        const std::vector<int>& playerIds,
+        const std::unordered_map<int, NetAddress>& playerToEndpoint)
     {
-        for (const auto& pair : connectionToPlayer)
+        std::vector<NetAddress> result;
+
+        for (int pid : playerIds)
         {
-            const ConnectionProfile* profile = hostEngine.FindPlayerProfile(pair.second);
-            if (profile != nullptr &&
-                profile->GetPlayerName() == username &&
-                profile->IsConnected())
+            auto it = playerToEndpoint.find(pid);
+            if (it != playerToEndpoint.end())
             {
-                return true;
+                result.push_back(it->second);
             }
         }
-        return false;
+
+        return result;
     }
 
-    void SendToConnection(SocketHub& socketHub, int connectionId, const std::vector<std::uint8_t>& payload)
+    void SendToEndpoint(
+        SocketHub& socketHub,
+        const NetAddress& endpoint,
+        const std::vector<std::uint8_t>& payload)
     {
-        socketHub.SendPacket(connectionId, payload);
+        socketHub.SendPacket(endpoint, payload);
     }
 
-    std::vector<int> GetConnectionsInRoom(
+    std::vector<std::uint8_t> WrapUdpPayload(
+        const std::vector<std::uint8_t>& payload,
+        std::uint32_t sequence = 1,
+        std::uint32_t ack = 0,
+        bool isAckOnly = false)
+    {
+        ByteWriter writer;
+        writer.WriteUInt32(sequence);
+        writer.WriteUInt32(ack);
+        writer.WriteBool(isAckOnly);
+
+        for (std::uint8_t b : payload)
+        {
+            writer.WriteUInt8(b);
+        }
+
+        return writer.GetBuffer();
+    }
+
+    void SendWrapped(
+        SocketHub& socketHub,
+        const NetAddress& endpoint,
+        const std::vector<std::uint8_t>& payload,
+        std::uint32_t ack = 0)
+    {
+        SendToEndpoint(socketHub, endpoint, WrapUdpPayload(payload, gServerSequence++, ack, false));
+    }
+
+    void SendAckOnly(
+        SocketHub& socketHub,
+        const NetAddress& endpoint,
+        std::uint32_t ack)
+    {
+        SendToEndpoint(socketHub, endpoint, WrapUdpPayload({}, 0, ack, true));
+    }
+
+    std::vector<NetAddress> GetEndpointsInRoom(
         int roomId,
         const HostEngine& hostEngine,
-        const std::unordered_map<int, int>& connectionToPlayer)
+        const std::unordered_map<int, NetAddress>& playerToEndpoint)
     {
-        std::vector<int> result;
+        std::vector<NetAddress> result;
 
-        for (auto it = connectionToPlayer.begin(); it != connectionToPlayer.end(); ++it)
+        for (const auto& pair : playerToEndpoint)
         {
-            int connectionId = it->first;
-            int playerId = it->second;
+            int playerId = pair.first;
+            const NetAddress& endpoint = pair.second;
 
             if (hostEngine.GetPlayerRoomId(playerId) == roomId)
             {
-                result.push_back(connectionId);
+                result.push_back(endpoint);
             }
         }
 
@@ -142,29 +164,29 @@ namespace
     void BroadcastToRoom(
         SocketHub& socketHub,
         const HostEngine& hostEngine,
-        const std::unordered_map<int, int>& connectionToPlayer,
+        const std::unordered_map<int, NetAddress>& playerToEndpoint,
         int roomId,
         const std::vector<std::uint8_t>& payload)
     {
-        std::vector<int> connections = GetConnectionsInRoom(roomId, hostEngine, connectionToPlayer);
+        std::vector<NetAddress> endpoints = GetEndpointsInRoom(roomId, hostEngine, playerToEndpoint);
 
-        for (std::size_t i = 0; i < connections.size(); ++i)
+        for (const NetAddress& endpoint : endpoints)
         {
-            SendToConnection(socketHub, connections[i], payload);
+            SendWrapped(socketHub, endpoint, payload);
         }
     }
 
     void BroadcastRoomSnapshot(
         SocketHub& socketHub,
         const HostEngine& hostEngine,
-        const std::unordered_map<int, int>& connectionToPlayer,
+        const std::unordered_map<int, NetAddress>& playerToEndpoint,
         int roomId)
     {
         RoomSnapshot snapshot = hostEngine.BuildRoomSnapshot(roomId);
         BroadcastToRoom(
             socketHub,
             hostEngine,
-            connectionToPlayer,
+            playerToEndpoint,
             roomId,
             WireFormat::MakeWaitingRoomPacket(snapshot)
         );
@@ -173,25 +195,31 @@ namespace
     void BroadcastMatchStarted(
         SocketHub& socketHub,
         const HostEngine& hostEngine,
-        const std::unordered_map<int, int>& connectionToPlayer,
+        const std::unordered_map<int, NetAddress>& playerToEndpoint,
         int roomId)
     {
-        std::vector<int> connections = GetConnectionsInRoom(roomId, hostEngine, connectionToPlayer);
+        std::vector<NetAddress> endpoints = GetEndpointsInRoom(roomId, hostEngine, playerToEndpoint);
 
-        for (std::size_t i = 0; i < connections.size(); ++i)
+        for (const NetAddress& endpoint : endpoints)
         {
-            int connectionId = connections[i];
-            auto mapIt = connectionToPlayer.find(connectionId);
-            if (mapIt == connectionToPlayer.end())
+            auto endpointIt = std::find_if(
+                playerToEndpoint.begin(),
+                playerToEndpoint.end(),
+                [&](const auto& pair)
+                {
+                    return pair.second == endpoint;
+                });
+
+            if (endpointIt == playerToEndpoint.end())
             {
                 continue;
             }
 
-            int playerId = mapIt->second;
+            int playerId = endpointIt->first;
             const PuzzleData* puzzle = hostEngine.GetPuzzleForPlayer(playerId);
             if (puzzle != nullptr)
             {
-                SendToConnection(socketHub, connectionId, WireFormat::MakeMatchStartedPacket(*puzzle));
+                SendWrapped(socketHub, endpoint, WireFormat::MakeMatchStartedPacket(*puzzle));
             }
         }
     }
@@ -199,54 +227,86 @@ namespace
     void BroadcastLeaderboard(
         SocketHub& socketHub,
         const HostEngine& hostEngine,
-        const std::unordered_map<int, int>& connectionToPlayer,
+        const std::unordered_map<int, NetAddress>& playerToEndpoint,
         int roomId)
     {
-        std::vector<int> connections = GetConnectionsInRoom(roomId, hostEngine, connectionToPlayer);
-        if (connections.empty())
+        std::vector<NetAddress> endpoints = GetEndpointsInRoom(roomId, hostEngine, playerToEndpoint);
+        if (endpoints.empty())
         {
             return;
         }
 
-        auto mapIt = connectionToPlayer.find(connections[0]);
-        if (mapIt == connectionToPlayer.end())
+        auto endpointIt = std::find_if(
+            playerToEndpoint.begin(),
+            playerToEndpoint.end(),
+            [&](const auto& pair)
+            {
+                return pair.second == endpoints[0];
+            });
+
+        if (endpointIt == playerToEndpoint.end())
         {
             return;
         }
 
-        std::vector<PlayerScoreInfo> leaderboard = hostEngine.GetLeaderboardForPlayer(mapIt->second);
+        std::vector<PlayerScoreInfo> leaderboard = hostEngine.GetLeaderboardForPlayer(endpointIt->first);
         PatchLeaderboardNames(hostEngine, leaderboard);
 
         BroadcastToRoom(
             socketHub,
             hostEngine,
-            connectionToPlayer,
+            playerToEndpoint,
             roomId,
             WireFormat::MakeLeaderboardPacket(leaderboard)
         );
     }
 
-    void SendError(SocketHub& socketHub, int connectionId, const std::string& text)
-    {
-        SendToConnection(socketHub, connectionId, WireFormat::MakeErrorPacket(text));
-    }
-
-    static void BroadcastPublicRoomList(
+    void BroadcastRoomPresenceState(
         SocketHub& socketHub,
         const HostEngine& hostEngine,
-        const std::unordered_map<int, bool>& connectionAuthenticated)
+        const std::unordered_map<int, NetAddress>& playerToEndpoint,
+        int roomId,
+        int anyPlayerInRoom)
+    {
+        BroadcastRoomSnapshot(socketHub, hostEngine, playerToEndpoint, roomId);
+
+        std::vector<PlayerScoreInfo> leaderboard = hostEngine.GetLeaderboardForPlayer(anyPlayerInRoom);
+        PatchLeaderboardNames(hostEngine, leaderboard);
+
+        BroadcastToRoom(
+            socketHub,
+            hostEngine,
+            playerToEndpoint,
+            roomId,
+            WireFormat::MakeLeaderboardPacket(leaderboard)
+        );
+    }
+
+    void SendError(
+        SocketHub& socketHub,
+        const NetAddress& endpoint,
+        const std::string& text)
+    {
+        SendWrapped(socketHub, endpoint, WireFormat::MakeErrorPacket(text));
+    }
+
+
+    void BroadcastPublicRoomList(
+        SocketHub& socketHub,
+        const HostEngine& hostEngine,
+        const std::unordered_map<NetAddress, bool, NetAddressHash>& endpointAuthenticated)
     {
         std::vector<PublicRoomInfo> rooms = hostEngine.GetPublicJoinableRooms();
         std::vector<std::uint8_t> payload = WireFormat::MakePublicRoomListResponsePacket(rooms);
 
-        for (const auto& pair : connectionAuthenticated)
+        for (const auto& pair : endpointAuthenticated)
         {
-            int connectionId = pair.first;
+            const NetAddress& endpoint = pair.first;
             bool authenticated = pair.second;
 
             if (authenticated)
             {
-                SendToConnection(socketHub, connectionId, payload);
+                SendWrapped(socketHub, endpoint, payload);
             }
         }
     }
@@ -264,6 +324,8 @@ namespace
         return false;
     }
 
+
+
     std::string BuildRoundFinishedText(const std::vector<PlayerScoreInfo>& leaderboard)
     {
         if (leaderboard.empty())
@@ -273,6 +335,79 @@ namespace
 
         return "Round finished! Winner: " + leaderboard[0].playerName;
     }
+
+    bool SaveMatchHistoryAndBroadcastIfRoundEnded(
+        SocketHub& socketHub,
+        HostEngine& hostEngine,
+        UserDatabase& userDb,
+        const std::unordered_map<int, NetAddress>& playerToEndpoint,
+        int roomId,
+        int playerId)
+    {
+        if (roomId == 0)
+        {
+            return false;
+        }
+
+        std::vector<PlayerScoreInfo> leaderboard = hostEngine.GetLeaderboardForPlayer(playerId);
+        PatchLeaderboardNames(hostEngine, leaderboard);
+
+        if (!HasAnyFinished(leaderboard))
+        {
+            return false;
+        }
+
+        std::vector<MatchStatsSnapshot> stats = hostEngine.GetMatchStatsForPlayer(playerId);
+        int totalTimeSeconds = hostEngine.GetElapsedMatchSecondsForPlayer(playerId);
+        int totalPlayers = static_cast<int>(leaderboard.size());
+        std::string playedAt = GetCurrentDateTimeString();
+
+        for (const MatchStatsSnapshot& stat : stats)
+        {
+            const ConnectionProfile* profile = hostEngine.FindPlayerProfile(stat.playerId);
+            if (profile == nullptr)
+            {
+                continue;
+            }
+
+            std::string resultText = (stat.finalRank == 1) ? "WIN" : "LOSE";
+
+            double avgMoveSeconds = 0.0;
+            if (stat.moveCount > 0)
+            {
+                avgMoveSeconds =
+                    static_cast<double>(totalTimeSeconds) /
+                    static_cast<double>(stat.moveCount);
+            }
+
+            bool ok = userDb.InsertMatchHistory(
+                profile->GetPlayerName(),
+                playedAt,
+                resultText,
+                stat.finalScore,
+                stat.wrongAttempts,
+                stat.hintsUsed,
+                totalTimeSeconds,
+                avgMoveSeconds,
+                stat.finalRank,
+                totalPlayers
+            );
+
+            std::cout << "[HistoryInsert] user=" << profile->GetPlayerName()
+                << " result=" << resultText
+                << " ok=" << (ok ? "YES" : "NO") << "\n";
+        }
+
+        BroadcastToRoom(
+            socketHub,
+            hostEngine,
+            playerToEndpoint,
+            roomId,
+            WireFormat::MakeRoundFinishedPacket(BuildRoundFinishedText(leaderboard))
+        );
+
+        return true;
+    }
 }
 
 int main()
@@ -280,8 +415,10 @@ int main()
     SocketHub socketHub;
     HostEngine hostEngine;
     UserDatabase userDb;
-    std::unordered_map<int, int> connectionToPlayer;
-    std::unordered_map<int, bool> connectionAuthenticated;
+    std::unordered_map<NetAddress, int, NetAddressHash> endpointToPlayer;
+    std::unordered_map<int, NetAddress> playerToEndpoint;
+    std::unordered_map<NetAddress, bool, NetAddressHash> endpointAuthenticated;
+    std::unordered_map<int, std::chrono::steady_clock::time_point> playerLastActive;
 
     if (!userDb.Open("sudoku_rush.db"))
     {
@@ -332,88 +469,150 @@ int main()
         {
             const SocketHub::Event& event = events[i];
 
-            if (event.type == SocketHub::EventType::Connected)
+            try
             {
-                std::cout << "Client connected. ConnectionId = " << event.connectionId << "\n";
-                continue;
-            }
-
-            if (event.type == SocketHub::EventType::Disconnected)
-            {
-                std::cout << "Client disconnected. ConnectionId = " << event.connectionId << "\n";
-
-                auto mapIt = connectionToPlayer.find(event.connectionId);
-                if (mapIt != connectionToPlayer.end())
+                if (event.payload.size() < 9)
                 {
-                    int playerId = mapIt->second;
-                    int roomId = hostEngine.GetPlayerRoomId(playerId);
+                    continue;
+                }
 
-                    ConnectionProfile* profile = hostEngine.FindPlayerProfile(playerId);
-                    if (profile != nullptr)
+                ByteReader envReader(event.payload);
+                ReliableEnvelope env = WireFormat::ReadReliableEnvelope(envReader);
+
+                if (env.isAckOnly)
+                {
+                    continue;
+                }
+
+                if (env.sequence != 0)
+                {
+                    SendAckOnly(socketHub, event.from, env.sequence);
+                }
+
+                std::vector<std::uint8_t> payload(
+                    event.payload.begin() + 9,
+                    event.payload.end()
+                );
+
+                ByteReader reader(payload);
+                PacketKind kind = WireFormat::ReadPacketKind(reader);
+
+                auto playerMapIt = endpointToPlayer.find(event.from);
+                if (playerMapIt != endpointToPlayer.end())
+                {
+                    int activePlayerId = playerMapIt->second;
+                    playerLastActive[activePlayerId] = std::chrono::steady_clock::now();
+
+                    ConnectionProfile* activeProfile = hostEngine.FindPlayerProfile(activePlayerId);
+                    if (activeProfile != nullptr && !activeProfile->IsConnected())
                     {
-                        profile->SetConnected(false);
-                        profile->SetReady(false);
-                        profile->SetPlayAgain(false);
-                    }
+                        activeProfile->SetConnected(true);
 
-                    bool wasHost = (roomId != 0) && hostEngine.IsHostOfRoom(playerId, roomId);
-
-                    if (roomId != 0)
-                    {
-                        if (wasHost)
+                        int activeRoomId = activeProfile->GetRoomId();
+                        if (activeRoomId != 0)
                         {
-                            std::vector<int> playerIds = hostEngine.GetPlayersInRoom(roomId);
-                            std::vector<int> roomConnections = GetConnectionsForPlayers(playerIds, connectionToPlayer);
-
-                            hostEngine.CloseRoom(roomId);
-
-                            for (int connId : roomConnections)
-                            {
-                                if (connId != event.connectionId)
-                                {
-                                    SendToConnection(
-                                        socketHub,
-                                        connId,
-                                        WireFormat::MakeRoomClosedNoticePacket("Host disconnected. Room closed.")
-                                    );
-                                }
-                            }
+                            BroadcastRoomPresenceState(
+                                socketHub,
+                                hostEngine,
+                                playerToEndpoint,
+                                activeRoomId,
+                                activePlayerId
+                            );
                         }
-                        else
-                        {
-                            hostEngine.RemovePlayerFromRoom(playerId);
-                        }
-                    }
-
-                    connectionToPlayer.erase(mapIt);
-                    connectionAuthenticated.erase(event.connectionId);
-
-                    if (roomId != 0 && !wasHost)
-                    {
-                        BroadcastRoomSnapshot(socketHub, hostEngine, connectionToPlayer, roomId);
-                    }
-
-                    if (roomId != 0)
-                    {
-                        BroadcastPublicRoomList(socketHub, hostEngine, connectionAuthenticated);
                     }
                 }
 
-                continue;
-            }
-
-            if (event.type != SocketHub::EventType::PacketReceived)
-            {
-                continue;
-            }
-
-            try
-            {
-                ByteReader reader(event.payload);
-                PacketKind kind = WireFormat::ReadPacketKind(reader);
-
                 switch (kind)
                 {
+
+                case PacketKind::DiscoverServerRequest:
+                {
+                    ServerAnnounceData data{};
+                    data.serverName = "Sudoku Rush Server";
+                    data.port = 54000;
+
+                    SendWrapped(
+                        socketHub,
+                        event.from,
+                        WireFormat::MakeServerAnnouncePacket(data)
+                    );
+                    break;
+                }
+
+                case PacketKind::Heartbeat:
+                {
+                    break;
+                }
+
+                case PacketKind::ResumeMatchRequest:
+                {
+                    auto mapIt = endpointToPlayer.find(event.from);
+                    if (mapIt == endpointToPlayer.end())
+                    {
+                        SendError(socketHub, event.from, "Player not registered.");
+                        break;
+                    }
+
+                    int playerId = mapIt->second;
+                    ConnectionProfile* profile = hostEngine.FindPlayerProfile(playerId);
+                    if (profile == nullptr)
+                    {
+                        SendError(socketHub, event.from, "Player profile not found.");
+                        break;
+                    }
+
+                    int roomId = profile->GetRoomId();
+                    if (roomId == 0)
+                    {
+                        SendError(socketHub, event.from, "No active room to resume.");
+                        break;
+                    }
+
+                    if (!hostEngine.IsMatchRunningForPlayer(playerId))
+                    {
+                        SendError(socketHub, event.from, "Match is no longer running.");
+                        break;
+                    }
+
+                    profile->SetConnected(true);
+                    playerLastActive[playerId] = std::chrono::steady_clock::now();
+
+                    const PuzzleData* puzzle = hostEngine.GetPuzzleForPlayer(playerId);
+                    if (puzzle != nullptr)
+                    {
+                        SendWrapped(
+                            socketHub,
+                            event.from,
+                            WireFormat::MakeMatchStartedPacket(*puzzle)
+                        );
+                    }
+
+                    std::vector<PlayerScoreInfo> leaderboard = hostEngine.GetLeaderboardForPlayer(playerId);
+                    PatchLeaderboardNames(hostEngine, leaderboard);
+
+                    SendWrapped(
+                        socketHub,
+                        event.from,
+                        WireFormat::MakeLeaderboardPacket(leaderboard)
+                    );
+
+                    HintState hintState = hostEngine.GetHintStateForPlayer(playerId);
+                    SendWrapped(
+                        socketHub,
+                        event.from,
+                        WireFormat::MakeHintUnlockedPacket(hintState)
+                    );
+
+                    BroadcastRoomPresenceState(
+                        socketHub,
+                        hostEngine,
+                        playerToEndpoint,
+                        roomId,
+                        playerId
+                    );
+
+                    break;
+                }
 
                 case PacketKind::SignUpRequest:
                 {
@@ -425,7 +624,7 @@ int main()
                     {
                         response.success = false;
                         response.text = "Username and password are required.";
-                        SendToConnection(socketHub, event.connectionId, WireFormat::MakeAuthResponsePacket(response));
+                        SendWrapped(socketHub, event.from, WireFormat::MakeAuthResponsePacket(response));
                         break;
                     }
 
@@ -433,7 +632,7 @@ int main()
                     {
                         response.success = false;
                         response.text = "Username already exists.";
-                        SendToConnection(socketHub, event.connectionId, WireFormat::MakeAuthResponsePacket(response));
+                        SendWrapped(socketHub, event.from, WireFormat::MakeAuthResponsePacket(response));
                         break;
                     }
 
@@ -441,25 +640,18 @@ int main()
                     {
                         response.success = false;
                         response.text = "Failed to register user.";
-                        SendToConnection(socketHub, event.connectionId, WireFormat::MakeAuthResponsePacket(response));
-                        break;
-                    }
-
-                    if (IsUsernameAlreadyLoggedIn(request.playerName, connectionToPlayer, hostEngine))
-                    {
-                        response.success = false;
-                        response.text = "This account is already logged in.";
-                        SendToConnection(socketHub, event.connectionId, WireFormat::MakeAuthResponsePacket(response));
+                        SendWrapped(socketHub, event.from, WireFormat::MakeAuthResponsePacket(response));
                         break;
                     }
 
                     int playerId = 0;
-                    auto mapIt = connectionToPlayer.find(event.connectionId);
+                    auto mapIt = endpointToPlayer.find(event.from);
 
-                    if (mapIt == connectionToPlayer.end())
+                    if (mapIt == endpointToPlayer.end())
                     {
                         playerId = hostEngine.RegisterPlayer(request.playerName);
-                        connectionToPlayer[event.connectionId] = playerId;
+                        endpointToPlayer[event.from] = playerId;
+                        playerToEndpoint[playerId] = event.from;
                     }
                     else
                     {
@@ -471,13 +663,22 @@ int main()
                         }
                     }
 
-                    connectionAuthenticated[event.connectionId] = true;
+                    endpointAuthenticated[event.from] = true;
+
+                    playerLastActive[playerId] = std::chrono::steady_clock::now();
+
+                    ConnectionProfile* signedUpProfile = hostEngine.FindPlayerProfile(playerId);
+                    if (signedUpProfile != nullptr)
+                    {
+                        signedUpProfile->SetConnected(true);
+                    }
+
 
                     response.success = true;
                     response.playerId = playerId;
                     response.text = "Sign up successful.";
 
-                    SendToConnection(socketHub, event.connectionId, WireFormat::MakeAuthResponsePacket(response));
+                    SendWrapped(socketHub, event.from, WireFormat::MakeAuthResponsePacket(response));
                     break;
                 }
 
@@ -491,15 +692,7 @@ int main()
                     {
                         response.success = false;
                         response.text = "Username and password are required.";
-                        SendToConnection(socketHub, event.connectionId, WireFormat::MakeAuthResponsePacket(response));
-                        break;
-                    }
-
-                    if (IsUsernameAlreadyLoggedIn(request.playerName, connectionToPlayer, hostEngine))
-                    {
-                        response.success = false;
-                        response.text = "This account is already logged in.";
-                        SendToConnection(socketHub, event.connectionId, WireFormat::MakeAuthResponsePacket(response));
+                        SendWrapped(socketHub, event.from, WireFormat::MakeAuthResponsePacket(response));
                         break;
                     }
 
@@ -507,7 +700,7 @@ int main()
                     {
                         response.success = false;
                         response.text = "User does not exist.";
-                        SendToConnection(socketHub, event.connectionId, WireFormat::MakeAuthResponsePacket(response));
+                        SendWrapped(socketHub, event.from, WireFormat::MakeAuthResponsePacket(response));
                         break;
                     }
 
@@ -515,17 +708,18 @@ int main()
                     {
                         response.success = false;
                         response.text = "Wrong password.";
-                        SendToConnection(socketHub, event.connectionId, WireFormat::MakeAuthResponsePacket(response));
+                        SendWrapped(socketHub, event.from, WireFormat::MakeAuthResponsePacket(response));
                         break;
                     }
 
                     int playerId = 0;
-                    auto mapIt = connectionToPlayer.find(event.connectionId);
+                    auto mapIt = endpointToPlayer.find(event.from);
 
-                    if (mapIt == connectionToPlayer.end())
+                    if (mapIt == endpointToPlayer.end())
                     {
                         playerId = hostEngine.RegisterPlayer(request.playerName);
-                        connectionToPlayer[event.connectionId] = playerId;
+                        endpointToPlayer[event.from] = playerId;
+                        playerToEndpoint[playerId] = event.from;
                     }
                     else
                     {
@@ -537,13 +731,21 @@ int main()
                         }
                     }
 
-                    connectionAuthenticated[event.connectionId] = true;
+                    endpointAuthenticated[event.from] = true;
+
+                    playerLastActive[playerId] = std::chrono::steady_clock::now();
+
+                    ConnectionProfile* signedInProfile = hostEngine.FindPlayerProfile(playerId);
+                    if (signedInProfile != nullptr)
+                    {
+                        signedInProfile->SetConnected(true);
+                    }
 
                     response.success = true;
                     response.playerId = playerId;
                     response.text = "Login successful.";
 
-                    SendToConnection(socketHub, event.connectionId, WireFormat::MakeAuthResponsePacket(response));
+                    SendWrapped(socketHub, event.from, WireFormat::MakeAuthResponsePacket(response));
                     break;
                 }
 
@@ -551,20 +753,20 @@ int main()
                 {
                     CreateRoomRequest request = WireFormat::ReadCreateRoomRequest(reader);
 
-                    auto authIt = connectionAuthenticated.find(event.connectionId);
-                    if (authIt == connectionAuthenticated.end() || !authIt->second)
+                    auto authIt = endpointAuthenticated.find(event.from);
+                    if (authIt == endpointAuthenticated.end() || !authIt->second)
                     {
                         RoomJoinedResponseData response{};
                         response.success = false;
                         response.text = "Please log in first.";
-                        SendToConnection(socketHub, event.connectionId, WireFormat::MakeRoomJoinedResponsePacket(response));
+                        SendWrapped(socketHub, event.from, WireFormat::MakeRoomJoinedResponsePacket(response));
                         break;
                     }
 
-                    auto mapIt = connectionToPlayer.find(event.connectionId);
-                    if (mapIt == connectionToPlayer.end())
+                    auto mapIt = endpointToPlayer.find(event.from);
+                    if (mapIt == endpointToPlayer.end())
                     {
-                        SendError(socketHub, event.connectionId, "Player not registered.");
+                        SendError(socketHub, event.from, "Player not registered.");
                         break;
                     }
 
@@ -577,12 +779,12 @@ int main()
                     response.roomId = roomId;
                     response.text = response.success ? "Room created." : "Failed to create room.";
 
-                    SendToConnection(socketHub, event.connectionId, WireFormat::MakeRoomJoinedResponsePacket(response));
+                    SendWrapped(socketHub, event.from, WireFormat::MakeRoomJoinedResponsePacket(response));
 
                     if (response.success)
                     {
-                        BroadcastRoomSnapshot(socketHub, hostEngine, connectionToPlayer, roomId);
-                        BroadcastPublicRoomList(socketHub, hostEngine, connectionAuthenticated);
+                        BroadcastRoomSnapshot(socketHub, hostEngine, playerToEndpoint, roomId);
+                        BroadcastPublicRoomList(socketHub, hostEngine, endpointAuthenticated);
                     }
                     break;
                 }
@@ -591,20 +793,20 @@ int main()
                 {
                     JoinRoomRequest request = WireFormat::ReadJoinRoomRequest(reader);
 
-                    auto authIt = connectionAuthenticated.find(event.connectionId);
-                    if (authIt == connectionAuthenticated.end() || !authIt->second)
+                    auto authIt = endpointAuthenticated.find(event.from);
+                    if (authIt == endpointAuthenticated.end() || !authIt->second)
                     {
                         RoomJoinedResponseData response{};
                         response.success = false;
                         response.text = "Please log in first.";
-                        SendToConnection(socketHub, event.connectionId, WireFormat::MakeRoomJoinedResponsePacket(response));
+                        SendWrapped(socketHub, event.from, WireFormat::MakeRoomJoinedResponsePacket(response));
                         break;
                     }
 
-                    auto mapIt = connectionToPlayer.find(event.connectionId);
-                    if (mapIt == connectionToPlayer.end())
+                    auto mapIt = endpointToPlayer.find(event.from);
+                    if (mapIt == endpointToPlayer.end())
                     {
-                        SendError(socketHub, event.connectionId, "Player not registered.");
+                        SendError(socketHub, event.from, "Player not registered.");
                         break;
                     }
 
@@ -617,22 +819,22 @@ int main()
                     response.roomId = joined ? request.roomId : 0;
                     response.text = joined ? "Joined room." : "Failed to join room.";
 
-                    SendToConnection(socketHub, event.connectionId, WireFormat::MakeRoomJoinedResponsePacket(response));
+                    SendWrapped(socketHub, event.from, WireFormat::MakeRoomJoinedResponsePacket(response));
 
                     if (joined)
                     {
-                        BroadcastRoomSnapshot(socketHub, hostEngine, connectionToPlayer, request.roomId);
-                        BroadcastPublicRoomList(socketHub, hostEngine, connectionAuthenticated);
+                        BroadcastRoomSnapshot(socketHub, hostEngine, playerToEndpoint, request.roomId);
+                        BroadcastPublicRoomList(socketHub, hostEngine, endpointAuthenticated);
                     }
                     break;
                 }
 
                 case PacketKind::ReadyToggleRequest:
                 {
-                    auto mapIt = connectionToPlayer.find(event.connectionId);
-                    if (mapIt == connectionToPlayer.end())
+                    auto mapIt = endpointToPlayer.find(event.from);
+                    if (mapIt == endpointToPlayer.end())
                     {
-                        SendError(socketHub, event.connectionId, "Player not registered.");
+                        SendError(socketHub, event.from, "Player not registered.");
                         break;
                     }
 
@@ -641,27 +843,27 @@ int main()
 
                     if (!hostEngine.SetPlayerReady(playerId, ready))
                     {
-                        SendError(socketHub, event.connectionId, "Failed to update ready state.");
+                        SendError(socketHub, event.from, "Failed to update ready state.");
                         break;
                     }
 
                     int roomId = hostEngine.GetPlayerRoomId(playerId);
-                    BroadcastRoomSnapshot(socketHub, hostEngine, connectionToPlayer, roomId);
+                    BroadcastRoomSnapshot(socketHub, hostEngine, playerToEndpoint, roomId);
 
                     if (hostEngine.TryStartMatch(roomId))
                     {
-                        BroadcastMatchStarted(socketHub, hostEngine, connectionToPlayer, roomId);
-                        BroadcastLeaderboard(socketHub, hostEngine, connectionToPlayer, roomId);
+                        BroadcastMatchStarted(socketHub, hostEngine, playerToEndpoint, roomId);
+                        BroadcastLeaderboard(socketHub, hostEngine, playerToEndpoint, roomId);
                     }
                     break;
                 }
 
                 case PacketKind::SubmitCellRequest:
                 {
-                    auto mapIt = connectionToPlayer.find(event.connectionId);
-                    if (mapIt == connectionToPlayer.end())
+                    auto mapIt = endpointToPlayer.find(event.from);
+                    if (mapIt == endpointToPlayer.end())
                     {
-                        SendError(socketHub, event.connectionId, "Player not registered.");
+                        SendError(socketHub, event.from, "Player not registered.");
                         break;
                     }
 
@@ -678,9 +880,9 @@ int main()
 
                     CellResult result = hostEngine.SubmitCell(submission);
 
-                    SendToConnection(
+                    SendWrapped(
                         socketHub,
-                        event.connectionId,
+                        event.from,
                         WireFormat::MakeCellCheckedPacket(result)
                     );
 
@@ -694,7 +896,7 @@ int main()
                         BroadcastToRoom(
                             socketHub,
                             hostEngine,
-                            connectionToPlayer,
+                            playerToEndpoint,
                             roomId,
                             WireFormat::MakeCellClaimUpdatePacket(claim)
                         );
@@ -706,7 +908,7 @@ int main()
                     BroadcastToRoom(
                         socketHub,
                         hostEngine,
-                        connectionToPlayer,
+                        playerToEndpoint,
                         roomId,
                         WireFormat::MakeLeaderboardPacket(leaderboard)
                     );
@@ -714,64 +916,27 @@ int main()
                     HintState hintState = hostEngine.GetHintStateForPlayer(playerId);
                     if (hintState.unlocked)
                     {
-                        SendToConnection(socketHub, event.connectionId, WireFormat::MakeHintUnlockedPacket(hintState));
+                        SendWrapped(socketHub, event.from, WireFormat::MakeHintUnlockedPacket(hintState));
                     }
 
-                    if (HasAnyFinished(leaderboard))
-                    {
-                        std::vector<MatchStatsSnapshot> stats = hostEngine.GetMatchStatsForPlayer(playerId);
-                        int totalTimeSeconds = hostEngine.GetElapsedMatchSecondsForPlayer(playerId);
-                        int totalPlayers = static_cast<int>(leaderboard.size());
-                        std::string playedAt = GetCurrentDateTimeString();
-
-                        for (const MatchStatsSnapshot& stat : stats)
-                        {
-                            const ConnectionProfile* profile = hostEngine.FindPlayerProfile(stat.playerId);
-                            if (profile == nullptr)
-                            {
-                                continue;
-                            }
-
-                            std::string resultText = (stat.finalRank == 1) ? "WIN" : "LOSE";
-
-                            double avgMoveSeconds = 0.0;
-                            if (stat.moveCount > 0)
-                            {
-                                avgMoveSeconds = static_cast<double>(totalTimeSeconds) / static_cast<double>(stat.moveCount);
-                            }
-
-                            userDb.InsertMatchHistory(
-                                profile->GetPlayerName(),
-                                playedAt,
-                                resultText,
-                                stat.finalScore,
-                                stat.wrongAttempts,
-                                stat.hintsUsed,
-                                totalTimeSeconds,
-                                avgMoveSeconds,
-                                stat.finalRank,
-                                totalPlayers
-                            );
-                        }
-
-                        BroadcastToRoom(
-                            socketHub,
-                            hostEngine,
-                            connectionToPlayer,
-                            roomId,
-                            WireFormat::MakeRoundFinishedPacket(BuildRoundFinishedText(leaderboard))
-                        );
-                    }
+                    SaveMatchHistoryAndBroadcastIfRoundEnded(
+                        socketHub,
+                        hostEngine,
+                        userDb,
+                        playerToEndpoint,
+                        roomId,
+                        playerId
+                    );
 
                     break;
                 }
 
                 case PacketKind::TogglePlayAgainRequest:
                 {
-                    auto mapIt = connectionToPlayer.find(event.connectionId);
-                    if (mapIt == connectionToPlayer.end())
+                    auto mapIt = endpointToPlayer.find(event.from);
+                    if (mapIt == endpointToPlayer.end())
                     {
-                        SendError(socketHub, event.connectionId, "Player not registered.");
+                        SendError(socketHub, event.from, "Player not registered.");
                         break;
                     }
 
@@ -781,24 +946,24 @@ int main()
 
                     if (!hostEngine.SetPlayerPlayAgain(playerId, playAgain))
                     {
-                        SendError(socketHub, event.connectionId, "Failed to update replay vote.");
+                        SendError(socketHub, event.from, "Failed to update replay vote.");
                         break;
                     }
 
                     if (hostEngine.TryStartReplay(roomId))
                     {
-                        BroadcastMatchStarted(socketHub, hostEngine, connectionToPlayer, roomId);
-                        BroadcastLeaderboard(socketHub, hostEngine, connectionToPlayer, roomId);
+                        BroadcastMatchStarted(socketHub, hostEngine, playerToEndpoint, roomId);
+                        BroadcastLeaderboard(socketHub, hostEngine, playerToEndpoint, roomId);
                     }
                     break;
                 }
 
                 case PacketKind::UseHintRequest:
                 {
-                    auto mapIt = connectionToPlayer.find(event.connectionId);
-                    if (mapIt == connectionToPlayer.end())
+                    auto mapIt = endpointToPlayer.find(event.from);
+                    if (mapIt == endpointToPlayer.end())
                     {
-                        SendError(socketHub, event.connectionId, "Player not registered.");
+                        SendError(socketHub, event.from, "Player not registered.");
                         break;
                     }
 
@@ -808,16 +973,16 @@ int main()
                     HintRequest request = WireFormat::ReadHintRequest(reader);
                     CellResult hintResult = hostEngine.UseHint(playerId, request.row, request.col);
 
-                    SendToConnection(
+                    SendWrapped(
                         socketHub,
-                        event.connectionId,
+                        event.from,
                         WireFormat::MakeCellCheckedPacket(hintResult)
                     );
 
                     HintState hintState = hostEngine.GetHintStateForPlayer(playerId);
-                    SendToConnection(
+                    SendWrapped(
                         socketHub,
-                        event.connectionId,
+                        event.from,
                         WireFormat::MakeHintUnlockedPacket(hintState)
                     );
 
@@ -827,21 +992,19 @@ int main()
                     BroadcastToRoom(
                         socketHub,
                         hostEngine,
-                        connectionToPlayer,
+                        playerToEndpoint,
                         roomId,
                         WireFormat::MakeLeaderboardPacket(leaderboard)
                     );
 
-                    if (HasAnyFinished(leaderboard))
-                    {
-                        BroadcastToRoom(
-                            socketHub,
-                            hostEngine,
-                            connectionToPlayer,
-                            roomId,
-                            WireFormat::MakeRoundFinishedPacket(BuildRoundFinishedText(leaderboard))
-                        );
-                    }
+                    SaveMatchHistoryAndBroadcastIfRoundEnded(
+                        socketHub,
+                        hostEngine,
+                        userDb,
+                        playerToEndpoint,
+                        roomId,
+                        playerId
+                    );
 
                     break;
                 }
@@ -869,9 +1032,9 @@ int main()
                         result.text = "User found.";
                     }
 
-                    SendToConnection(
+                    SendWrapped(
                         socketHub,
-                        event.connectionId,
+                        event.from,
                         WireFormat::MakeSearchUserResponsePacket(result)
                     );
                     break;
@@ -879,10 +1042,10 @@ int main()
 
                 case PacketKind::SendFriendRequest:
                 {
-                    std::string fromUser = GetUsernameForConnection(event.connectionId, connectionToPlayer, hostEngine);
+                    std::string fromUser = GetUsernameForEndpoint(event.from, endpointToPlayer, hostEngine);
                     if (fromUser.empty())
                     {
-                        SendError(socketHub, event.connectionId, "Not authenticated.");
+                        SendError(socketHub, event.from, "Not authenticated.");
                         break;
                     }
 
@@ -920,15 +1083,15 @@ int main()
                         {
                             responseText = "Friend request sent.";
 
-                            int targetConnectionId = FindConnectionIdByUsername(targetUser, connectionToPlayer, hostEngine);
-                            if (targetConnectionId != 0)
+                            NetAddress* targetEndpoint = FindEndpointByUsername(targetUser, playerToEndpoint, hostEngine);
+                            if (targetEndpoint != nullptr)
                             {
                                 FriendInfo info{};
                                 info.username = fromUser;
                                 std::cout << "[FriendRequestResult] " << responseText << "\n";
-                                SendToConnection(
+                                SendWrapped(
                                     socketHub,
-                                    targetConnectionId,
+                                    *targetEndpoint,
                                     WireFormat::MakeFriendRequestReceivedPacket(info)
                                 );
                             }
@@ -939,9 +1102,9 @@ int main()
                         }
                     }
 
-                    SendToConnection(
+                    SendWrapped(
                         socketHub,
-                        event.connectionId,
+                        event.from,
                         WireFormat::MakeFriendRequestResponsePacket(responseText)
                     );
                     break;
@@ -949,10 +1112,10 @@ int main()
 
                 case PacketKind::RespondFriendRequest:
                 {
-                    std::string currentUser = GetUsernameForConnection(event.connectionId, connectionToPlayer, hostEngine);
+                    std::string currentUser = GetUsernameForEndpoint(event.from, endpointToPlayer, hostEngine);
                     if (currentUser.empty())
                     {
-                        SendError(socketHub, event.connectionId, "Not authenticated.");
+                        SendError(socketHub, event.from, "Not authenticated.");
                         break;
                     }
 
@@ -979,48 +1142,48 @@ int main()
                         responseText = "Friend request declined.";
                     }
 
-                    SendToConnection(
+                    SendWrapped(
                         socketHub,
-                        event.connectionId,
+                        event.from,
                         WireFormat::MakeFriendRequestResponsePacket(responseText)
                     );
 
                     std::vector<FriendInfo> updatedFriends = userDb.GetFriendsForUser(currentUser);
-                    SendToConnection(
+                    SendWrapped(
                         socketHub,
-                        event.connectionId,
+                        event.from,
                         WireFormat::MakeFriendsListResponsePacket(updatedFriends)
                     );
 
                     std::vector<FriendInfo> updatedRequests = userDb.GetPendingFriendRequestsForUser(currentUser);
-                    SendToConnection(
+                    SendWrapped(
                         socketHub,
-                        event.connectionId,
+                        event.from,
                         WireFormat::MakePendingFriendRequestsResponsePacket(updatedRequests)
                     );
 
                     if (decision.accept)
                     {
-                        int otherConnectionId = FindConnectionIdByUsername(
+                        NetAddress* otherEndpoint = FindEndpointByUsername(
                             decision.fromUsername,
-                            connectionToPlayer,
+                            playerToEndpoint,
                             hostEngine
                         );
 
-                        if (otherConnectionId != 0)
+                        if (otherEndpoint != nullptr)
                         {
                             std::vector<FriendInfo> otherUpdatedFriends =
                                 userDb.GetFriendsForUser(decision.fromUsername);
 
-                            SendToConnection(
+                            SendWrapped(
                                 socketHub,
-                                otherConnectionId,
+                                *otherEndpoint,
                                 WireFormat::MakeFriendsListResponsePacket(otherUpdatedFriends)
                             );
 
-                            SendToConnection(
+                            SendWrapped(
                                 socketHub,
-                                otherConnectionId,
+                                *otherEndpoint,
                                 WireFormat::MakeFriendRequestResponsePacket(
                                     currentUser + " accepted your friend request."
                                 )
@@ -1033,17 +1196,17 @@ int main()
 
                 case PacketKind::RequestFriendsList:
                 {
-                    std::string currentUser = GetUsernameForConnection(event.connectionId, connectionToPlayer, hostEngine);
+                    std::string currentUser = GetUsernameForEndpoint(event.from, endpointToPlayer, hostEngine);
                     if (currentUser.empty())
                     {
-                        SendError(socketHub, event.connectionId, "Not authenticated.");
+                        SendError(socketHub, event.from, "Not authenticated.");
                         break;
                     }
 
                     std::vector<FriendInfo> friends = userDb.GetFriendsForUser(currentUser);
-                    SendToConnection(
+                    SendWrapped(
                         socketHub,
-                        event.connectionId,
+                        event.from,
                         WireFormat::MakeFriendsListResponsePacket(friends)
                     );
                     break;
@@ -1051,17 +1214,17 @@ int main()
 
                 case PacketKind::RequestPendingFriendRequests:
                 {
-                    std::string currentUser = GetUsernameForConnection(event.connectionId, connectionToPlayer, hostEngine);
+                    std::string currentUser = GetUsernameForEndpoint(event.from, endpointToPlayer, hostEngine);
                     if (currentUser.empty())
                     {
-                        SendError(socketHub, event.connectionId, "Not authenticated.");
+                        SendError(socketHub, event.from, "Not authenticated.");
                         break;
                     }
 
                     std::vector<FriendInfo> requests = userDb.GetPendingFriendRequestsForUser(currentUser);
-                    SendToConnection(
+                    SendWrapped(
                         socketHub,
-                        event.connectionId,
+                        event.from,
                         WireFormat::MakePendingFriendRequestsResponsePacket(requests)
                     );
                     break;
@@ -1069,10 +1232,10 @@ int main()
 
                 case PacketKind::SendPrivateMessage:
                 {
-                    std::string fromUser = GetUsernameForConnection(event.connectionId, connectionToPlayer, hostEngine);
+                    std::string fromUser = GetUsernameForEndpoint(event.from, endpointToPlayer, hostEngine);
                     if (fromUser.empty())
                     {
-                        SendError(socketHub, event.connectionId, "Not authenticated.");
+                        SendError(socketHub, event.from, "Not authenticated.");
                         break;
                     }
 
@@ -1080,13 +1243,13 @@ int main()
 
                     if (payload.targetUsername.empty() || payload.text.empty())
                     {
-                        SendError(socketHub, event.connectionId, "Invalid private message.");
+                        SendError(socketHub, event.from, "Invalid private message.");
                         break;
                     }
 
                     if (!userDb.AreFriends(fromUser, payload.targetUsername))
                     {
-                        SendError(socketHub, event.connectionId, "You can only message friends.");
+                        SendError(socketHub, event.from, "You can only message friends.");
                         break;
                     }
 
@@ -1096,18 +1259,18 @@ int main()
                     msg.text = payload.text;
                     msg.timestamp = GetCurrentDateTimeString();
 
-                    SendToConnection(
+                    SendWrapped(
                         socketHub,
-                        event.connectionId,
+                        event.from,
                         WireFormat::MakePrivateMessageReceivedPacket(msg)
                     );
 
-                    int targetConnectionId = FindConnectionIdByUsername(payload.targetUsername, connectionToPlayer, hostEngine);
-                    if (targetConnectionId != 0)
+                    NetAddress* targetEndpoint = FindEndpointByUsername(payload.targetUsername, playerToEndpoint, hostEngine);
+                    if (targetEndpoint != nullptr)
                     {
-                        SendToConnection(
+                        SendWrapped(
                             socketHub,
-                            targetConnectionId,
+                            *targetEndpoint,
                             WireFormat::MakePrivateMessageReceivedPacket(msg)
                         );
                     }
@@ -1117,10 +1280,10 @@ int main()
 
                 case PacketKind::HistoryRequest:
                 {
-                    auto mapIt = connectionToPlayer.find(event.connectionId);
-                    if (mapIt == connectionToPlayer.end())
+                    auto mapIt = endpointToPlayer.find(event.from);
+                    if (mapIt == endpointToPlayer.end())
                     {
-                        SendError(socketHub, event.connectionId, "Player not registered.");
+                        SendError(socketHub, event.from, "Player not registered.");
                         break;
                     }
 
@@ -1128,21 +1291,21 @@ int main()
                     const ConnectionProfile* profile = hostEngine.FindPlayerProfile(playerId);
                     if (profile == nullptr)
                     {
-                        SendError(socketHub, event.connectionId, "Player profile not found.");
+                        SendError(socketHub, event.from, "Player profile not found.");
                         break;
                     }
 
                     std::vector<MatchHistoryRow> history = userDb.GetMatchHistoryForUser(profile->GetPlayerName());
-                    SendToConnection(socketHub, event.connectionId, WireFormat::MakeHistoryResponsePacket(history));
+                    SendWrapped(socketHub, event.from, WireFormat::MakeHistoryResponsePacket(history));
                     break;
                 }
 
                 case PacketKind::LeaveRoomRequest:
                 {
-                    auto mapIt = connectionToPlayer.find(event.connectionId);
-                    if (mapIt == connectionToPlayer.end())
+                    auto mapIt = endpointToPlayer.find(event.from);
+                    if (mapIt == endpointToPlayer.end())
                     {
-                        SendError(socketHub, event.connectionId, "Player not registered.");
+                        SendError(socketHub, event.from, "Player not registered.");
                         break;
                     }
 
@@ -1154,7 +1317,7 @@ int main()
                         LeaveRoomResponseData response{};
                         response.success = false;
                         response.text = "Not in a room.";
-                        SendToConnection(socketHub, event.connectionId,
+                        SendWrapped(socketHub, event.from,
                             WireFormat::MakeLeaveRoomResponsePacket(response));
                         break;
                     }
@@ -1164,17 +1327,17 @@ int main()
                     if (isHost)
                     {
                         std::vector<int> playerIds = hostEngine.GetPlayersInRoom(roomId);
-                        std::vector<int> roomConnections = GetConnectionsForPlayers(playerIds, connectionToPlayer);
+                        std::vector<NetAddress> roomEndpoints = GetEndpointsForPlayers(playerIds, playerToEndpoint);
 
                         hostEngine.CloseRoom(roomId);
 
-                        for (int connId : roomConnections)
+                        for (const NetAddress& endpoint : roomEndpoints)
                         {
-                            SendToConnection(socketHub, connId,
+                            SendWrapped(socketHub, endpoint,
                                 WireFormat::MakeRoomClosedNoticePacket("Host left. Room closed."));
                         }
 
-                        BroadcastPublicRoomList(socketHub, hostEngine, connectionAuthenticated);
+                        BroadcastPublicRoomList(socketHub, hostEngine, endpointAuthenticated);
                     }
                     else
                     {
@@ -1184,13 +1347,13 @@ int main()
                         response.success = removed;
                         response.text = removed ? "Left room." : "Failed to leave room.";
 
-                        SendToConnection(socketHub, event.connectionId,
+                        SendWrapped(socketHub, event.from,
                             WireFormat::MakeLeaveRoomResponsePacket(response));
 
                         if (removed)
                         {
-                            BroadcastRoomSnapshot(socketHub, hostEngine, connectionToPlayer, roomId);
-                            BroadcastPublicRoomList(socketHub, hostEngine, connectionAuthenticated);
+                            BroadcastRoomSnapshot(socketHub, hostEngine, playerToEndpoint, roomId);
+                            BroadcastPublicRoomList(socketHub, hostEngine, endpointAuthenticated);
                         }
                     }
 
@@ -1199,10 +1362,10 @@ int main()
 
                 case PacketKind::SendRoomChatMessage:
                 {
-                    auto mapIt = connectionToPlayer.find(event.connectionId);
-                    if (mapIt == connectionToPlayer.end())
+                    auto mapIt = endpointToPlayer.find(event.from);
+                    if (mapIt == endpointToPlayer.end())
                     {
-                        SendError(socketHub, event.connectionId, "Player not registered.");
+                        SendError(socketHub, event.from, "Player not registered.");
                         break;
                     }
 
@@ -1211,14 +1374,14 @@ int main()
 
                     if (roomId == 0)
                     {
-                        SendError(socketHub, event.connectionId, "Not in a room.");
+                        SendError(socketHub, event.from, "Not in a room.");
                         break;
                     }
 
                     const ConnectionProfile* profile = hostEngine.FindPlayerProfile(playerId);
                     if (profile == nullptr)
                     {
-                        SendError(socketHub, event.connectionId, "Player profile not found.");
+                        SendError(socketHub, event.from, "Player profile not found.");
                         break;
                     }
 
@@ -1230,7 +1393,7 @@ int main()
                     BroadcastToRoom(
                         socketHub,
                         hostEngine,
-                        connectionToPlayer,
+                        playerToEndpoint,
                         roomId,
                         WireFormat::MakeRoomChatMessagePacket(msg)
                     );
@@ -1241,26 +1404,145 @@ int main()
                 {
                     std::vector<PublicRoomInfo> rooms = hostEngine.GetPublicJoinableRooms();
 
-                    SendToConnection(
+                    SendWrapped(
                         socketHub,
-                        event.connectionId,
+                        event.from,
                         WireFormat::MakePublicRoomListResponsePacket(rooms)
                     );
                     break;
                 }
 
                 default:
-                    SendError(socketHub, event.connectionId, "Unhandled packet kind.");
+                    SendError(socketHub, event.from, "Unhandled packet kind.");
                     break;
                 }
             }
             catch (const std::exception& ex)
             {
-                SendError(socketHub, event.connectionId, std::string("Packet decode error: ") + ex.what());
+                SendError(socketHub, event.from, std::string("Packet decode error: ") + ex.what());
+            }
+        }
+
+        {
+            auto now = std::chrono::steady_clock::now();
+
+            for (auto& pair : playerLastActive)
+            {
+                int playerId = pair.first;
+                auto lastActive = pair.second;
+
+                const ConnectionProfile* profile = hostEngine.FindPlayerProfile(playerId);
+                if (profile == nullptr)
+                {
+                    continue;
+                }
+
+                int roomId = profile->GetRoomId();
+                if (roomId == 0)
+                {
+                    continue;
+                }
+
+                long long idleMs =
+                    std::chrono::duration_cast<std::chrono::milliseconds>(now - lastActive).count();
+
+                bool matchRunning = hostEngine.IsMatchRunningForPlayer(playerId);
+
+                ConnectionProfile* mutableProfile = hostEngine.FindPlayerProfile(playerId);
+                if (mutableProfile == nullptr)
+                {
+                    continue;
+                }
+
+                if (!matchRunning)
+                {
+                    if (idleMs >= kWaitingRoomIdleMs)
+                    {
+                        auto endpointIt = playerToEndpoint.find(playerId);
+                        if (endpointIt == playerToEndpoint.end())
+                        {
+                            continue;
+                        }
+
+                        NetAddress endpoint = endpointIt->second;
+                        bool isHost = hostEngine.IsHostOfRoom(playerId, roomId);
+
+                        if (isHost)
+                        {
+                            std::vector<int> playerIds = hostEngine.GetPlayersInRoom(roomId);
+                            std::vector<NetAddress> roomEndpoints = GetEndpointsForPlayers(playerIds, playerToEndpoint);
+
+                            hostEngine.CloseRoom(roomId);
+
+                            for (const NetAddress& roomEndpoint : roomEndpoints)
+                            {
+                                SendWrapped(
+                                    socketHub,
+                                    roomEndpoint,
+                                    WireFormat::MakeRoomClosedNoticePacket("Host inactive. Room closed.")
+                                );
+                            }
+
+                            BroadcastPublicRoomList(socketHub, hostEngine, endpointAuthenticated);
+                        }
+                        else
+                        {
+                            bool removed = hostEngine.RemovePlayerFromRoom(playerId);
+
+                            LeaveRoomResponseData response{};
+                            response.success = removed;
+                            response.text = removed
+                                ? "Removed from room due to inactivity."
+                                : "Failed to remove inactive player.";
+
+                            SendWrapped(
+                                socketHub,
+                                endpoint,
+                                WireFormat::MakeLeaveRoomResponsePacket(response)
+                            );
+
+                            if (removed)
+                            {
+                                BroadcastRoomSnapshot(socketHub, hostEngine, playerToEndpoint, roomId);
+                                BroadcastPublicRoomList(socketHub, hostEngine, endpointAuthenticated);
+                            }
+                        }
+
+                        mutableProfile->SetConnected(false);
+                    }
+                }
+                else
+                {
+                    if (idleMs >= kPlayingTimeoutMs && mutableProfile->IsConnected())
+                    {
+                        mutableProfile->SetConnected(false);
+
+                        auto endpointIt = playerToEndpoint.find(playerId);
+                        if (endpointIt != playerToEndpoint.end())
+                        {
+                            SendWrapped(
+                                socketHub,
+                                endpointIt->second,
+                                WireFormat::MakeErrorPacket(
+                                    "Disconnected due to inactivity. Click Resume if the match is still running."
+                                )
+                            );
+                        }
+
+                        BroadcastRoomPresenceState(
+                            socketHub,
+                            hostEngine,
+                            playerToEndpoint,
+                            roomId,
+                            playerId
+                        );
+                    }
+                }
             }
         }
 
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
+
     }
 
     socketHub.Stop();

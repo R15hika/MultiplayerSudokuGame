@@ -2,27 +2,41 @@
 
 #include <cstdint>
 #include <string>
-#include <unordered_map>
+#include <functional>
 #include <vector>
 
 #define WIN32_LEAN_AND_MEAN
 #include <winsock2.h>
 #include <ws2tcpip.h>
 
+struct NetAddress
+{
+    sockaddr_in addr{};
+
+    bool operator==(const NetAddress& other) const
+    {
+        return addr.sin_family == other.addr.sin_family &&
+            addr.sin_port == other.addr.sin_port &&
+            addr.sin_addr.s_addr == other.addr.sin_addr.s_addr;
+    }
+};
+
+struct NetAddressHash
+{
+    std::size_t operator()(const NetAddress& value) const
+    {
+        std::size_t h1 = std::hash<unsigned long>{}(value.addr.sin_addr.s_addr);
+        std::size_t h2 = std::hash<unsigned short>{}(value.addr.sin_port);
+        return h1 ^ (h2 << 1);
+    }
+};
+
 class SocketHub
 {
 public:
-    enum class EventType
-    {
-        Connected = 0,
-        Disconnected,
-        PacketReceived
-    };
-
     struct Event
     {
-        EventType type = EventType::Connected;
-        int connectionId = 0;
+        NetAddress from{};
         std::vector<std::uint8_t> payload;
     };
 
@@ -35,34 +49,15 @@ public:
     bool IsRunning() const;
 
     void PollEvents(std::vector<Event>& outEvents);
-
-    bool SendPacket(int connectionId, const std::vector<std::uint8_t>& payload);
-    void DisconnectClient(int connectionId);
-
-    std::vector<int> GetConnectionIds() const;
-
-private:
-    struct ClientState
-    {
-        SOCKET socketHandle = INVALID_SOCKET;
-        std::vector<std::uint8_t> receiveBuffer;
-    };
+    bool SendPacket(const NetAddress& target, const std::vector<std::uint8_t>& payload);
 
 private:
     bool InitializeWinsock();
     void ShutdownWinsock();
-
     bool SetSocketNonBlocking(SOCKET socketHandle);
-    void AcceptPendingConnections(std::vector<Event>& outEvents);
-    void ReceiveFromClients(std::vector<Event>& outEvents);
-
-    bool SendAll(SOCKET socketHandle, const std::uint8_t* data, int byteCount);
-    void RemoveClient(int connectionId);
 
 private:
     bool mWinsockInitialized = false;
     bool mRunning = false;
-    SOCKET mListenSocket = INVALID_SOCKET;
-    int mNextConnectionId = 1;
-    std::unordered_map<int, ClientState> mClients;
+    SOCKET mSocket = INVALID_SOCKET;
 };

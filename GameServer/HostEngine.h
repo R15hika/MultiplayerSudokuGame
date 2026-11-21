@@ -1,6 +1,7 @@
 #pragma once
 
 #include <vector>
+#include <string>
 
 #include "../Shared/SharedModels.h"
 #include "ConnectionProfile.h"
@@ -45,6 +46,7 @@ public:
     const ConnectionProfile* FindPlayerProfile(int playerId) const;
 
     bool IsHostOfRoom(int playerId, int roomId) const;
+    bool IsMatchRunningForPlayer(int playerId) const;
     bool CloseRoom(int roomId);
     std::vector<int> GetPlayersInRoom(int roomId) const;
 
