@@ -116,6 +116,22 @@ void ByteReader::RequireBytes(std::size_t count)
 
 namespace WireFormat
 {
+    void WriteReliableEnvelope(ByteWriter& writer, const ReliableEnvelope& value)
+    {
+        writer.WriteUInt32(value.sequence);
+        writer.WriteUInt32(value.ack);
+        writer.WriteBool(value.isAckOnly);
+    }
+
+    ReliableEnvelope ReadReliableEnvelope(ByteReader& reader)
+    {
+        ReliableEnvelope value{};
+        value.sequence = reader.ReadUInt32();
+        value.ack = reader.ReadUInt32();
+        value.isAckOnly = reader.ReadBool();
+        return value;
+    }
+
     void WriteUserSearchResult(ByteWriter& writer, const UserSearchResult& value)
     {
         writer.WriteBool(value.found);
@@ -215,6 +231,12 @@ namespace WireFormat
         writer.WriteString(value.timestamp);
     }
 
+    void WriteServerAnnounce(ByteWriter& writer, const ServerAnnounceData& value)
+    {
+        writer.WriteString(value.serverName);
+        writer.WriteUInt16(value.port);
+    }
+
     PrivateChatMessage ReadPrivateChatMessage(ByteReader& reader)
     {
         PrivateChatMessage value{};
@@ -222,6 +244,14 @@ namespace WireFormat
         value.receiverName = reader.ReadString();
         value.text = reader.ReadString();
         value.timestamp = reader.ReadString();
+        return value;
+    }
+
+    ServerAnnounceData ReadServerAnnounce(ByteReader& reader)
+    {
+        ServerAnnounceData value{};
+        value.serverName = reader.ReadString();
+        value.port = reader.ReadUInt16();
         return value;
     }
 
@@ -632,6 +662,21 @@ namespace WireFormat
         return value;
     }
 
+    std::vector<std::uint8_t> MakeDiscoverServerPacket()
+    {
+        ByteWriter writer;
+        writer.WriteUInt16(static_cast<std::uint16_t>(PacketKind::DiscoverServerRequest));
+        return writer.GetBuffer();
+    }
+
+    std::vector<std::uint8_t> MakeServerAnnouncePacket(const ServerAnnounceData& data)
+    {
+        ByteWriter writer;
+        writer.WriteUInt16(static_cast<std::uint16_t>(PacketKind::ServerAnnounce));
+        WriteServerAnnounce(writer, data);
+        return writer.GetBuffer();
+    }
+
     std::vector<std::uint8_t> MakeSignUpPacket(const AuthRequest& request)
     {
         ByteWriter writer;
@@ -639,6 +684,7 @@ namespace WireFormat
         WriteAuthRequest(writer, request);
         return writer.GetBuffer();
     }
+
 
     std::vector<std::uint8_t> MakeSignInPacket(const AuthRequest& request)
     {
@@ -754,6 +800,20 @@ namespace WireFormat
     {
         ByteWriter writer;
         writer.WriteUInt16(static_cast<std::uint16_t>(PacketKind::RequestPendingFriendRequests));
+        return writer.GetBuffer();
+    }
+
+    std::vector<std::uint8_t> MakeHeartbeatPacket()
+    {
+        ByteWriter writer;
+        writer.WriteUInt16(static_cast<std::uint16_t>(PacketKind::Heartbeat));
+        return writer.GetBuffer();
+    }
+
+    std::vector<std::uint8_t> MakeResumeMatchRequestPacket()
+    {
+        ByteWriter writer;
+        writer.WriteUInt16(static_cast<std::uint16_t>(PacketKind::ResumeMatchRequest));
         return writer.GetBuffer();
     }
 
@@ -938,4 +998,6 @@ namespace WireFormat
         writer.WriteString(text);
         return writer.GetBuffer();
     }
+
+
 }

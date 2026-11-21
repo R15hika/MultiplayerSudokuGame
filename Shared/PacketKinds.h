@@ -6,6 +6,9 @@ enum class PacketKind : std::uint16_t
 {
     Invalid = 0,
 
+    DiscoverServerRequest,
+    ServerAnnounce,
+
     // Client -> Server
     SignUpRequest,
     SignInRequest,
@@ -27,7 +30,8 @@ enum class PacketKind : std::uint16_t
     RespondFriendRequest,
     RequestFriendsList,
     RequestPendingFriendRequests,
-
+    Heartbeat,
+    ResumeMatchRequest,
 
     // Server -> Client
     AuthResponse,

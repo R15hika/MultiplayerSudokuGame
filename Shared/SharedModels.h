@@ -90,14 +90,18 @@ struct RoomSnapshot
     bool countdownStarted = false;
 };
 
-
-
 struct PublicRoomInfo
 {
     int roomId = 0;
     int currentPlayers = 0;
     int maxPlayers = RuleBook::MIN_PLAYERS;
     std::string hostName;
+};
+
+struct ServerAnnounceData
+{
+    std::string serverName;
+    unsigned short port = 0;
 };
 
 struct ChatMessage
@@ -296,4 +300,11 @@ struct PrivateChatMessage
     std::string receiverName;
     std::string text;
     std::string timestamp;
+};
+
+struct ReliableEnvelope
+{
+    std::uint32_t sequence = 0;
+    std::uint32_t ack = 0;
+    bool isAckOnly = false;
 };

@@ -48,6 +48,9 @@ private:
 
 namespace WireFormat
 {
+    void WriteReliableEnvelope(ByteWriter& writer, const ReliableEnvelope& value);
+    ReliableEnvelope ReadReliableEnvelope(ByteReader& reader);
+
     void WriteUserSearchResult(ByteWriter& writer, const UserSearchResult& value);
     UserSearchResult ReadUserSearchResult(ByteReader& reader);
 
@@ -85,7 +88,8 @@ namespace WireFormat
     std::vector<std::uint8_t> MakeRespondFriendRequestPacket(const FriendRequestDecision& decision);
     std::vector<std::uint8_t> MakeRequestFriendsListPacket();
     std::vector<std::uint8_t> MakeRequestPendingFriendRequestsPacket();
-
+    std::vector<std::uint8_t> MakeHeartbeatPacket();
+    std::vector<std::uint8_t> MakeResumeMatchRequestPacket();
     std::vector<std::uint8_t> MakeFriendsListResponsePacket(const std::vector<FriendInfo>& friends);
     std::vector<std::uint8_t> MakePendingFriendRequestsResponsePacket(const std::vector<FriendInfo>& requests);
 
@@ -95,6 +99,8 @@ namespace WireFormat
     std::vector<std::uint8_t> MakeFriendRequestResponsePacket(const std::string& text);
     
     std::vector<std::uint8_t> WritePacketKind(PacketKind kind);
+
+
     PacketKind ReadPacketKind(ByteReader& reader);
 
     void WriteAuthRequest(ByteWriter& writer, const AuthRequest& value);
@@ -155,9 +161,15 @@ namespace WireFormat
     void WritePuzzleData(ByteWriter& writer, const PuzzleData& value);
     PuzzleData ReadPuzzleData(ByteReader& reader);
 
+
+    void WriteServerAnnounce(ByteWriter& writer, const ServerAnnounceData& value);
+
     std::vector<std::uint8_t> MakeSignUpPacket(const AuthRequest& request);
     std::vector<std::uint8_t> MakeSignInPacket(const AuthRequest& request);
     std::vector<std::uint8_t> MakeAuthResponsePacket(const AuthResponseData& response);
+    std::vector<std::uint8_t> MakeDiscoverServerPacket();
+    std::vector<std::uint8_t> MakeServerAnnouncePacket(const ServerAnnounceData& data);
+    ServerAnnounceData ReadServerAnnounce(ByteReader& reader);
     std::vector<std::uint8_t> MakeRoomChatMessagePacket(const ChatMessage& msg);
     std::vector<std::uint8_t> MakeSendRoomChatPacket(const std::string& text);
     std::vector<std::uint8_t> MakeCreateRoomPacket(const CreateRoomRequest& request);
